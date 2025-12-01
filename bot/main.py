@@ -2,6 +2,8 @@ import os
 import logging
 from typing import Any, Dict, List, cast
 import re
+import time
+import random
 from urllib.parse import urlparse
 import requests
 from bs4 import BeautifulSoup
@@ -21,9 +23,36 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Initialize OpenAI client
-# the newest OpenAI model is "gpt-4.1-mini" which was released June 2024.
-# do not change this unless explicitly requested by the user
 openai_client = None
+
+
+def get_random_user_agent() -> str:
+    """Возвращает случайный User-Agent из списка."""
+    user_agents = [
+        # Chrome на Windows
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.6045.159 Safari/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36",
+        
+        # Chrome на Mac
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_14_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+        
+        # Firefox
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:121.0) Gecko/20100101 Firefox/121.0",
+        "Mozilla/5.0 (X11; Linux x86_64; rv:120.0) Gecko/20100101 Firefox/120.0",
+        
+        # Safari
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_14_6) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.1.2 Safari/605.1.15",
+        
+        # Edge
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36 Edg/119.0.0.0",
+    ]
+    
+    return random.choice(user_agents)
 
 
 def load_system_prompt() -> str:
@@ -62,7 +91,11 @@ def is_url(text: str) -> bool:
     text = text.strip()
     try:
         parsed = urlparse(text)
-        return parsed.scheme in ("http", "https") and bool(parsed.netloc)
+        # Более строгая проверка для URL
+        return (parsed.scheme in ("http", "https") and 
+                bool(parsed.netloc) and 
+                '.' in parsed.netloc and
+                len(parsed.netloc) > 3)
     except ValueError:
         return False
 
@@ -84,36 +117,73 @@ def extract_text_from_pdf_bytes(data: bytes) -> str:
 def extract_text_from_url(url: str) -> str:
     """
     Скачиваем страницу/файл по ссылке и вытаскиваем текст.
-
-    ВАЖНО:
-    - никакие HTTPError наружу не вылетают;
-    - мы конвертим их в RuntimeError с кодами:
-        * REMOTE_FORBIDDEN      — сайт вернул 403;
-        * NETWORK_ERROR         — сетевые ошибки/таймауты;
-        * REMOTE_HTTP_ERROR_XYZ — другие HTTP-коды (404, 500 и т.п.).
+    
+    УЛУЧШЕННЫЙ ВАРИАНТ с обходом блокировок:
+    - Случайный User-Agent
+    - Полный набор заголовков браузера
+    - Задержка перед запросом
+    - Поддержка редиректов
+    - Обработка кодировки
     """
+    # Случайный User-Agent для каждого запроса
     headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0.0.0 Safari/537.36"
-        )
+        "User-Agent": get_random_user_agent(),
+        "Accept": (
+            "text/html,application/xhtml+xml,application/xml;"
+            "q=0.9,image/webp,image/apng,*/*;q=0.8,"
+            "application/signed-exchange;v=b3;q=0.7"
+        ),
+        "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7,uk;q=0.6,de;q=0.5",
+        "Accept-Encoding": "gzip, deflate, br",
+        "DNT": "1",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+        "Cache-Control": "max-age=0",
+        "Pragma": "no-cache",
+        "Referer": "https://www.google.com/",  # Добавляем реферер
     }
-
+    
+    # Параметры для обхода блокировок
+    request_params = {
+        "headers": headers,
+        "timeout": 15,  # Увеличиваем таймаут
+        "allow_redirects": True,  # Разрешаем редиректы
+        "verify": True,  # Проверяем SSL
+        "stream": False,  # Не использовать stream для простых запросов
+    }
+    
     try:
-        resp = requests.get(url, headers=headers, timeout=10)
+        # Небольшая случайная задержка (имитация поведения человека)
+        time.sleep(random.uniform(0.5, 2.0))
+        
+        logger.info(f"Fetching URL: {url} with User-Agent: {headers['User-Agent'][:50]}...")
+        
+        resp = requests.get(url, **request_params)
         logger.info(f"Fetched URL {url} with status {resp.status_code}")
+        
         # Если статус уже не 2xx — сразу обрабатываем
         if resp.status_code == 403:
             logger.warning(f"Forbidden (403) while fetching {url}")
             raise RuntimeError("REMOTE_FORBIDDEN")
+        
+        if resp.status_code == 429:
+            logger.warning(f"Too Many Requests (429) while fetching {url}")
+            raise RuntimeError("REMOTE_HTTP_ERROR_429")
 
         if resp.status_code < 200 or resp.status_code >= 300:
             code = resp.status_code
             logger.error(f"Non-OK HTTP status {code} while fetching {url}")
             raise RuntimeError(f"REMOTE_HTTP_ERROR_{code}")
+    
     except requests.Timeout as e:
         logger.error(f"Timeout while fetching {url}: {e}")
+        raise RuntimeError("NETWORK_ERROR") from e
+    except requests.TooManyRedirects as e:
+        logger.error(f"Too many redirects for {url}: {e}")
         raise RuntimeError("NETWORK_ERROR") from e
     except requests.RequestException as e:
         # Любые другие сетевые ошибки
@@ -121,14 +191,61 @@ def extract_text_from_url(url: str) -> str:
         raise RuntimeError("NETWORK_ERROR") from e
 
     # Если мы здесь — статус 2xx, можно парсить
-    content_type = resp.headers.get("Content-Type", "")
-    if "pdf" in content_type.lower():
+    content_type = resp.headers.get("Content-Type", "").lower()
+    
+    # Пробуем определить кодировку если не указана
+    if not resp.encoding:
+        try:
+            # Простая проверка на UTF-8
+            resp.content.decode('utf-8')
+            resp.encoding = 'utf-8'
+        except UnicodeDecodeError:
+            # Пробуем другие кодировки
+            try:
+                resp.content.decode('cp1251')
+                resp.encoding = 'cp1251'
+            except:
+                resp.encoding = 'utf-8'  # По умолчанию
+    
+    # Обработка PDF
+    if "pdf" in content_type:
         return extract_text_from_pdf_bytes(resp.content)
-
-    soup = BeautifulSoup(resp.text, "html.parser")
-    body = soup.body or soup
-    text = body.get_text(separator="\n")
-    return clean_text(text)
+    
+    # Обработка HTML
+    try:
+        # Используем 'html.parser' для надежности (не требует lxml)
+        soup = BeautifulSoup(resp.content, "html.parser", from_encoding=resp.encoding)
+        
+        # Удаляем ненужные элементы
+        for element in soup(["script", "style", "nav", "footer", "header", 
+                           "aside", "form", "iframe", "noscript"]):
+            element.decompose()
+        
+        # Получаем основной контент
+        # Сначала ищем article, main, или div с контентом
+        main_content = soup.find('article') or soup.find('main') or soup.find('div', class_=re.compile(r'content|post|article|text', re.I))
+        
+        if main_content:
+            body = main_content
+        else:
+            body = soup.body or soup
+        
+        # Получаем текст с сохранением структуры
+        text = body.get_text(separator="\n", strip=True)
+        
+        # Дополнительная очистка
+        text = re.sub(r'\s*\n\s*\n\s*', '\n\n', text)  # Убираем лишние пустые строки
+        text = re.sub(r'[ \t]+', ' ', text)  # Заменяем множественные пробелы
+        
+        return clean_text(text)
+    
+    except Exception as e:
+        logger.error(f"Error parsing HTML from {url}: {e}")
+        # В случае ошибки парсинга, пробуем просто получить весь текст
+        try:
+            return clean_text(resp.text)
+        except:
+            raise RuntimeError("PARSING_ERROR")
 
 
 def prepare_input_text(raw: str) -> str:
@@ -142,7 +259,17 @@ def prepare_input_text(raw: str) -> str:
     raw = raw.strip()
     if is_url(raw):
         logger.info(f"Detected URL message: {raw}")
-        return extract_text_from_url(raw)
+        try:
+            return extract_text_from_url(raw)
+        except RuntimeError as e:
+            # Пробуем добавить https:// если его нет
+            if not raw.startswith(('http://', 'https://')):
+                try:
+                    return extract_text_from_url('https://' + raw)
+                except:
+                    raise e
+            else:
+                raise e
     return clean_text(raw)
 
 
@@ -162,8 +289,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     await message.reply_html(
-        f"Привет {user.mention_html()}! Я твой помощник в поиске работы и по сопроводительным письмам. "
-        f"Отправь резюме или ссылку на него, а я подберу формулировки и соберу письма под нужные вакансии"
+        rf"Привет {user.mention_html()}! Я твой помощник в поиске работы и по сопроводительным письмам. "
+        rf"Отправь резюме или ссылку на него, а я подберу формулировки и соберу письма под нужные вакансии"
     )
 
 
@@ -176,9 +303,9 @@ async def help_command(update: Update,
         return
 
     help_text = """
-Available commands:
-/start - Start the bot
-/help - Show this help message.
+Доступные команды:
+/start - Запустить бота
+/help - Показать это сообщение помощи
 /update_resume - Загрузите новые файлы с описанием вашего опыта
 
 Чтобы я работал точнее, сначала пришли полное описание своих навыков, опыта и достижений или резюме.
@@ -188,6 +315,11 @@ Available commands:
 * таблицу совпадений и процент совпадения
 * пункты, которые лучше подсветить при отклике
 * готовое сопроводительное письмо
+
+Поддерживаемые форматы:
+- Текст (просто отправьте текст)
+- PDF файлы
+- Ссылки на вакансии (большинство сайтов)
 
     """
     await message.reply_text(help_text)
@@ -268,34 +400,55 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             code = str(e)
             if code == "REMOTE_FORBIDDEN":
                 await message.reply_text(
-                    "Сайт по этой ссылке не разрешает автоматически считывать содержимое "
-                    "с моего сервера (возвращает 403 Forbidden).\n\n"
-                    "Пожалуйста, скопируйте текст вакансии и пришлите его сюда текстом."
+                    "⚠️ Сайт заблокировал доступ с моего сервера (ошибка 403 Forbidden).\n\n"
+                    "🔹 **Что можно сделать:**\n"
+                    "1. Скопируйте текст вакансии и пришлите его сюда текстом\n"
+                    "2. Попробуйте другую ссылку\n"
+                    "3. Используйте PDF версию вакансии\n\n"
+                    "Некоторые сайты (особенно с hh.ru, rabota.ru) защищают свои страницы от автоматического парсинга."
+                )
+                return
+            elif code == "REMOTE_HTTP_ERROR_429":
+                await message.reply_text(
+                    "⚠️ Сайт ограничил количество запросов (Too Many Requests).\n\n"
+                    "Пожалуйста, подождите 1-2 минуты и попробуйте снова, "
+                    "или скопируйте текст вакансии вручную."
                 )
                 return
             elif code == "NETWORK_ERROR":
                 await message.reply_text(
-                    "Не удалось подключиться к сайту по ссылке. "
+                    "⚠️ Не удалось подключиться к сайту по ссылке.\n\n"
+                    "🔹 **Возможные причины:**\n"
+                    "1. Сайт временно недоступен\n"
+                    "2. Проблемы с сетью\n"
+                    "3. Неверная ссылка\n\n"
                     "Попробуйте ещё раз позже или пришлите текст вакансии вручную."
                 )
                 return
             elif code.startswith("REMOTE_HTTP_ERROR_"):
                 status = code.split("_")[-1]
                 await message.reply_text(
-                    f"Сайт по этой ссылке вернул ошибку {status} и не даёт автоматически получить текст.\n\n"
+                    f"⚠️ Сайт вернул ошибку {status}.\n\n"
+                    "Пожалуйста, скопируйте текст вакансии и отправьте его сюда текстом, "
+                    "или проверьте правильность ссылки."
+                )
+                return
+            elif code == "PARSING_ERROR":
+                await message.reply_text(
+                    "⚠️ Не удалось обработать содержимое страницы.\n\n"
                     "Пожалуйста, скопируйте текст вакансии и отправьте его сюда."
                 )
                 return
             else:
                 logger.error(f"Runtime error while processing input text or URL: {e}")
                 await message.reply_text(
-                    "Не удалось обработать текст или ссылку. Попробуйте другой формат."
+                    "❌ Не удалось обработать текст или ссылку. Попробуйте другой формат."
                 )
                 return
         except Exception as e:
             logger.error(f"Error while processing input text or URL: {e}")
             await message.reply_text(
-                "Не удалось обработать текст или ссылку. Попробуйте другой формат."
+                "❌ Не удалось обработать текст или ссылку. Попробуйте другой формат."
             )
             return
 
@@ -304,7 +457,8 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         user_data["resume"] = user_message
         user_data["awaiting_resume"] = False
         await message.reply_text(
-            "Спасибо! Я обновил информацию о вашем опыте. Теперь отправьте вакансию или вопрос, "
+            "✅ Спасибо! Я обновил информацию о вашем опыте.\n\n"
+            "Теперь отправьте вакансию или вопрос, "
             "и я буду использовать это резюме для анализа."
         )
         return
