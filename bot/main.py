@@ -79,18 +79,37 @@ def render_page_with_playwright(url: str,
     }
     try:
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
+            # Try to look like real Chrome; fallback to bundled Chromium
+            try:
+                browser = p.chromium.launch(channel="chrome", headless=True)
+            except Exception:
+                browser = p.chromium.launch(headless=True)
             context = browser.new_context(
                 user_agent=headers.get("User-Agent"),
                 extra_http_headers=extra_headers,
+                ignore_https_errors=True,
+                locale="ru-RU",
+                timezone_id="Europe/Moscow",
+                viewport={"width": 1366, "height": 768},
             )
             page = context.new_page()
             page.goto(url, wait_until="networkidle", timeout=timeout_ms)
+            try:
+                page.wait_for_selector("body", timeout=timeout_ms // 2)
+                for sel in ["main", "article", "h1"]:
+                    try:
+                        page.wait_for_selector(sel, timeout=timeout_ms // 3)
+                        break
+                    except Exception:
+                        continue
+            except Exception:
+                pass
             page.wait_for_timeout(random.randint(500, 1200))
             html = page.content()
             context.close()
             browser.close()
-            logger.info(f"Playwright: rendered {url} (len={len(html)})")
+            snippet = html[:500].replace("\n", " ") if html else ""
+            logger.info(f"Playwright: rendered {url} (len={len(html)}), head: {snippet}")
             return html
     except Exception as e:
         logger.info(f"Playwright render failed for {url}: {e}")
@@ -193,6 +212,9 @@ def _try_tochka_special(url: str) -> str:
     logger.info("Playwright attempt for tochka.com URL")
     rendered_html = render_page_with_playwright(url, headers)
     if rendered_html:
+        if len(rendered_html) < 800:
+            logger.info(f"Playwright HTML too short for tochka.com (len={len(rendered_html)}), returning link")
+            return f"Вакансия на tochka.com: {url}"
         parsed = _parse_html_content(rendered_html, url)
         if parsed:
             return parsed
@@ -364,6 +386,9 @@ def _try_general_parsing(url: str) -> str:
         # First try rendered page via Playwright to bypass JS/anti-bot gates
         html = render_page_with_playwright(url, headers)
         if html:
+            if len(html) < 800:
+                logger.info(f"Playwright HTML too short for general URL (len={len(html)}), returning link")
+                return clean_text(f"Ссылка на вакансию: {url}")
             parsed_html = _parse_html_content(html, url)
             if parsed_html:
                 return parsed_html
