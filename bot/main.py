@@ -5,11 +5,13 @@ import re
 import time
 import random
 import json
+import asyncio
 from urllib.parse import urlparse, urljoin
 import requests
 from bs4 import BeautifulSoup
 from io import BytesIO
 from PyPDF2 import PdfReader
+from playwright.sync_api import sync_playwright
 
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
@@ -64,6 +66,35 @@ def get_browser_headers() -> dict:
     })
     
     return headers
+
+
+def render_page_with_playwright(url: str,
+                                headers: Dict[str, str],
+                                timeout_ms: int = 15000) -> str:
+    """Fetch fully rendered HTML with Playwright to bypass simple anti-bot walls."""
+    logger.info(f"Playwright: rendering {url}")
+    extra_headers = {
+        k: v for k, v in headers.items()
+        if k.lower() not in ["user-agent", "host"]
+    }
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            context = browser.new_context(
+                user_agent=headers.get("User-Agent"),
+                extra_http_headers=extra_headers,
+            )
+            page = context.new_page()
+            page.goto(url, wait_until="networkidle", timeout=timeout_ms)
+            page.wait_for_timeout(random.randint(500, 1200))
+            html = page.content()
+            context.close()
+            browser.close()
+            logger.info(f"Playwright: rendered {url} (len={len(html)})")
+            return html
+    except Exception as e:
+        logger.info(f"Playwright render failed for {url}: {e}")
+        return ""
 
 
 def load_system_prompt() -> str:
@@ -157,6 +188,17 @@ def _try_tochka_special(url: str) -> str:
         'Origin': 'https://tochka.com',
         'Host': 'tochka.com',
     })
+    
+    # Try headless browser first to avoid 403 blocks
+    logger.info("Playwright attempt for tochka.com URL")
+    rendered_html = render_page_with_playwright(url, headers)
+    if rendered_html:
+        parsed = _parse_html_content(rendered_html, url)
+        if parsed:
+            return parsed
+    else:
+        logger.info("Playwright returned empty content for tochka.com")
+    
     
     # Пробуем разные эндпоинты
     endpoints_to_try = [
@@ -313,11 +355,21 @@ def _try_general_parsing(url: str) -> str:
     # Добавляем реферер
     parsed = urlparse(url)
     headers['Referer'] = f"{parsed.scheme}://{parsed.netloc}/"
+    logger.info(f"Playwright attempt for general URL: {url}")
     
     session.headers.update(headers)
     
     try:
         # Эмуляция поведения браузера
+        # First try rendered page via Playwright to bypass JS/anti-bot gates
+        html = render_page_with_playwright(url, headers)
+        if html:
+            parsed_html = _parse_html_content(html, url)
+            if parsed_html:
+                return parsed_html
+        else:
+            logger.info(f"Playwright returned empty content for general URL: {url}")
+
         
         # 1. Сначала на главную страницу
         try:
@@ -563,7 +615,7 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await message.chat.send_action(action="typing")
         
         # ВСЕГДА получаем текст, даже если это ссылка
-        user_message = prepare_input_text(raw_text)
+        user_message = await asyncio.to_thread(prepare_input_text, raw_text)
 
     # Если ожидаем новое резюме после /update_resume — сохраняем его и не вызываем OpenAI
     if user_data.get("awaiting_resume"):
