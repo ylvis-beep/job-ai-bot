@@ -1,138 +1,162 @@
 import os
 import logging
-from typing import Any, Dict, List, cast  # <<< ADDED
-import re  # <<< ADDED
-from urllib.parse import urlparse  # <<< ADDED
-import requests  # <<< ADDED
-from bs4 import BeautifulSoup  # <<< ADDED
-from io import BytesIO  # <<< ADDED
-from PyPDF2 import PdfReader  # <<< ADDED
+from typing import Any, Dict, List, cast
+import re
+from urllib.parse import urlparse
+import requests
+from bs4 import BeautifulSoup
+from io import BytesIO
+from PyPDF2 import PdfReader
 
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from openai import OpenAI
-from openai.types.chat import ChatCompletionMessageParam  # <<< ADDED
+from openai.types.chat import ChatCompletionMessageParam
 
 # Enable logging
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO)
+    level=logging.INFO
+)
 logger = logging.getLogger(__name__)
 
 # Initialize OpenAI client
-# the newest OpenAI model is "gpt-4.1-mini" which was released June 2024.  # <<< CHANGED
+# the newest OpenAI model is "gpt-4.1-mini" which was released June 2024.
 # do not change this unless explicitly requested by the user
 openai_client = None
 
 
-def load_system_prompt() -> str:  # <<< ADDED
-    """Load the system prompt from system_prompt.txt if it exists."""  # <<< ADDED
-    try:  # <<< ADDED
-        base_dir = os.path.dirname(os.path.abspath(__file__))  # <<< ADDED
-        file_path = os.path.join(base_dir, "system_prompt.txt")  # <<< ADDED
-        with open(file_path, "r", encoding="utf-8") as f:  # <<< ADDED
-            return f.read()  # <<< ADDED
-    except FileNotFoundError:  # <<< ADDED
-        return "You are a helpful assistant."  # <<< ADDED
-    except Exception as e:  # <<< ADDED
-        logger.warning(f"Failed to load system_prompt.txt: {e}")  # <<< ADDED
-        return "You are a helpful assistant."  # <<< ADDED
+def load_system_prompt() -> str:
+    """Load the system prompt from system_prompt.txt if it exists."""
+    try:
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        file_path = os.path.join(base_dir, "system_prompt.txt")
+        with open(file_path, "r", encoding="utf-8") as f:
+            return f.read()
+    except FileNotFoundError:
+        return "You are a helpful assistant."
+    except Exception as e:
+        logger.warning(f"Failed to load system_prompt.txt: {e}")
+        return "You are a helpful assistant."
 
 
 # =========================
-# Парсинг текста / ссылок / PDF  # <<< ADDED
+# Парсинг текста / ссылок / PDF
 # =========================
 
-def clean_text(raw: str) -> str:  # <<< ADDED
-    """Приводит текст в аккуратный вид."""  # <<< ADDED
-    if not raw:  # <<< ADDED
-        return ""  # <<< ADDED
-    text = raw.replace("\r\n", "\n")  # <<< ADDED
-    lines = [line.strip() for line in text.split("\n")]  # <<< ADDED
-    text = "\n".join(lines)  # <<< ADDED
-    text = re.sub(r"\n{3,}", "\n\n", text)  # <<< ADDED
-    return text.strip()  # <<< ADDED
+def clean_text(raw: str) -> str:
+    """Приводит текст в аккуратный вид."""
+    if not raw:
+        return ""
+    text = raw.replace("\r\n", "\n")
+    lines = [line.strip() for line in text.split("\n")]
+    text = "\n".join(lines)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
 
 
-def is_url(text: str) -> bool:  # <<< ADDED
-    """Проверяем, похожа ли строка на URL."""  # <<< ADDED
-    if not text:  # <<< ADDED
-        return False  # <<< ADDED
-    text = text.strip()  # <<< ADDED
-    try:  # <<< ADDED
-        parsed = urlparse(text)  # <<< ADDED
-        return parsed.scheme in ("http", "https") and bool(parsed.netloc)  # <<< ADDED
-    except ValueError:  # <<< ADDED
-        return False  # <<< ADDED
+def is_url(text: str) -> bool:
+    """Проверяем, похожа ли строка на URL (если сообщение целиком — URL)."""
+    if not text:
+        return False
+    text = text.strip()
+    try:
+        parsed = urlparse(text)
+        return parsed.scheme in ("http", "https") and bool(parsed.netloc)
+    except ValueError:
+        return False
 
 
-def extract_text_from_pdf_bytes(data: bytes) -> str:  # <<< ADDED
-    """Достаём текст из PDF по сырым байтам."""  # <<< ADDED
-    try:  # <<< ADDED
-        reader = PdfReader(BytesIO(data))  # <<< ADDED
-        pages_text: List[str] = []  # <<< ADDED
-        for page in reader.pages:  # <<< ADDED
-            page_text = page.extract_text() or ""  # <<< ADDED
-            pages_text.append(page_text)  # <<< ADDED
-        return clean_text("\n\n".join(pages_text))  # <<< ADDED
-    except Exception as e:  # <<< ADDED
-        logger.error(f"Error while extracting text from PDF bytes: {e}")  # <<< ADDED
-        return ""  # <<< ADDED
+def extract_text_from_pdf_bytes(data: bytes) -> str:
+    """Достаём текст из PDF по сырым байтам."""
+    try:
+        reader = PdfReader(BytesIO(data))
+        pages_text: List[str] = []
+        for page in reader.pages:
+            page_text = page.extract_text() or ""
+            pages_text.append(page_text)
+        return clean_text("\n\n".join(pages_text))
+    except Exception as e:
+        logger.error(f"Error while extracting text from PDF bytes: {e}")
+        return ""
 
 
-def extract_text_from_url(url: str) -> str:  # <<< ADDED
-    """Скачиваем страницу/файл по ссылке и вытаскиваем текст."""  # <<< ADDED
-    headers = {  # <<< ADDED
-        "User-Agent": (  # <<< ADDED
+def extract_text_from_url(url: str) -> str:
+    """
+    Скачиваем страницу/файл по ссылке и вытаскиваем текст.
+
+    Если сайт отвечает 403 (Forbidden) — поднимаем специальную ошибка REMOTE_FORBIDDEN,
+    чтобы выше по стеку показать пользователю понятное сообщение.
+    """
+    headers = {
+        "User-Agent": (
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
             "Chrome/120.0.0.0 Safari/537.36"
         )
     }
 
-    resp = requests.get(url, headers=headers, timeout=10)  # <<< ADDED
-    resp.raise_for_status()  # <<< ADDED
+    try:
+        resp = requests.get(url, headers=headers, timeout=10)
+        logger.info(f"Fetched URL {url} with status {resp.status_code}")
+    except requests.RequestException as e:
+        logger.error(f"Network error while fetching {url}: {e}")
+        # даём понять наверх, что проблема с сетью/подключением
+        raise RuntimeError("NETWORK_ERROR") from e
 
-    content_type = resp.headers.get("Content-Type", "")  # <<< ADDED
-    if "pdf" in content_type.lower():  # <<< ADDED
-        return extract_text_from_pdf_bytes(resp.content)  # <<< ADDED
+    # сайт сознательно не даёт читать себя с нашего сервера
+    if resp.status_code == 403:
+        logger.warning(f"Forbidden (403) while fetching {url}")
+        raise RuntimeError("REMOTE_FORBIDDEN")
 
-    soup = BeautifulSoup(resp.text, "html.parser")  # <<< ADDED
-    body = soup.body or soup  # <<< ADDED
-    text = body.get_text(separator="\n")  # <<< ADDED
-    return clean_text(text)  # <<< ADDED
+    # остальные коды ошибок пусть превращаются в обычные HTTPError
+    try:
+        resp.raise_for_status()
+    except requests.HTTPError as e:
+        logger.error(f"HTTP error while fetching {url}: {e}")
+        raise
+
+    content_type = resp.headers.get("Content-Type", "")
+    if "pdf" in content_type.lower():
+        return extract_text_from_pdf_bytes(resp.content)
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    body = soup.body or soup
+    text = body.get_text(separator="\n")
+    return clean_text(text)
 
 
-def prepare_input_text(raw: str) -> str:  # <<< ADDED
+def prepare_input_text(raw: str) -> str:
     """
     Универсальная функция:
-    - если ссылка — скачиваем и чистим,
+    - если строка целиком — ссылка, скачиваем и чистим,
     - если текст — просто чистим.
-    """  # <<< ADDED
-    if not raw:  # <<< ADDED
-        return ""  # <<< ADDED
-    raw = raw.strip()  # <<< ADDED
-    if is_url(raw):  # <<< ADDED
-        return extract_text_from_url(raw)  # <<< ADDED
-    return clean_text(raw)  # <<< ADDED
+    """
+    if not raw:
+        return ""
+    raw = raw.strip()
+    if is_url(raw):
+        logger.info(f"Detected URL message: {raw}")
+        return extract_text_from_url(raw)
+    return clean_text(raw)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Send a message when the command /start is issued."""
-    message = update.message  # <<< ADDED
-    if message is None:  # <<< ADDED
-        logger.warning("Received /start update without message")  # <<< ADDED
-        return  # <<< ADDED
+    message = update.message
+    if message is None:
+        logger.warning("Received /start update without message")
+        return
 
-    user = update.effective_user  # <<< ADDED
-    if user is None:  # <<< ADDED
-        await message.reply_text(  # <<< ADDED
+    user = update.effective_user
+    if user is None:
+        await message.reply_text(
             "Привет! Я твой помощник в поиске работы и по сопроводительным письмам. "
             "Отправь резюме или ссылку на него, а я подберу формулировки и соберу письма под нужные вакансии"
         )
-        return  # <<< ADDED
+        return
 
-    await message.reply_html(  # <<< CHANGED
+    await message.reply_html(
         f"Привет {user.mention_html()}! Я твой помощник в поиске работы и по сопроводительным письмам. "
         f"Отправь резюме или ссылку на него, а я подберу формулировки и соберу письма под нужные вакансии"
     )
@@ -141,10 +165,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def help_command(update: Update,
                        context: ContextTypes.DEFAULT_TYPE) -> None:
     """Send a message when the command /help is issued."""
-    message = update.message  # <<< ADDED
-    if message is None:  # <<< ADDED
-        logger.warning("Received /help update without message")  # <<< ADDED
-        return  # <<< ADDED
+    message = update.message
+    if message is None:
+        logger.warning("Received /help update without message")
+        return
 
     help_text = """
 Available commands:
@@ -161,29 +185,29 @@ Available commands:
 * готовое сопроводительное письмо
 
     """
-    await message.reply_text(help_text)  # <<< CHANGED
+    await message.reply_text(help_text)
 
 
 async def update_resume(update: Update,
                         context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /update_resume command."""
-    message = update.message  # <<< ADDED
-    if message is None:  # <<< ADDED
-        logger.warning("Received /update_resume update without message")  # <<< ADDED
-        return  # <<< ADDED
+    message = update.message
+    if message is None:
+        logger.warning("Received /update_resume update without message")
+        return
 
-    user_data = cast(Dict[str, Any], context.user_data)  # <<< ADDED
-    user_data['awaiting_resume'] = True  # <<< CHANGED
-    user_data.pop('resume', None)  # <<< CHANGED
-    await message.reply_text("Загрузите новые файлы с описанием вашего опыта")  # <<< CHANGED
+    user_data = cast(Dict[str, Any], context.user_data)
+    user_data['awaiting_resume'] = True
+    user_data.pop('resume', None)
+    await message.reply_text("Загрузите новые файлы с описанием вашего опыта")
 
 
 async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle user messages with OpenAI."""
-    message = update.message  # <<< ADDED
-    if message is None:  # <<< ADDED
-        logger.warning("Received text update without message in chat handler")  # <<< ADDED
-        return  # <<< ADDED
+    message = update.message
+    if message is None:
+        logger.warning("Received text update without message in chat handler")
+        return
 
     if not openai_client:
         await message.reply_text(
@@ -191,19 +215,19 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
-    user_data = cast(Dict[str, Any], context.user_data)  # <<< ADDED
+    user_data = cast(Dict[str, Any], context.user_data)
 
-    # Определяем, откуда брать текст: PDF или текст  # <<< ADDED
-    user_message: str  # <<< ADDED
+    # Определяем, откуда брать текст: PDF или текст
+    user_message: str
 
-    if message.document is not None:  # <<< ADDED
-        doc = message.document  # <<< ADDED
+    if message.document is not None:
+        doc = message.document
         is_pdf = (
             doc.mime_type == "application/pdf"
             or (doc.file_name and doc.file_name.lower().endswith(".pdf"))
         )
 
-        if not is_pdf:  # <<< ADDED
+        if not is_pdf:
             await message.reply_text(
                 "Сейчас я умею обрабатывать только PDF-файлы и текстовые сообщения."
             )
@@ -235,6 +259,28 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             return
         try:
             user_message = prepare_input_text(raw_text)
+        except RuntimeError as e:
+            # наши спец-ошибки из extract_text_from_url
+            code = str(e)
+            if code == "REMOTE_FORBIDDEN":
+                await message.reply_text(
+                    "Сайт по этой ссылке не разрешает автоматически считывать содержимое "
+                    "с моего сервера (отдаёт 403 Forbidden).\n\n"
+                    "Пожалуйста, скопируйте текст вакансии и пришлите его сюда текстом."
+                )
+                return
+            elif code == "NETWORK_ERROR":
+                await message.reply_text(
+                    "Не удалось подключиться к сайту по ссылке. "
+                    "Попробуйте ещё раз позже или пришлите текст вакансии вручную."
+                )
+                return
+            else:
+                logger.error(f"Runtime error while processing input text or URL: {e}")
+                await message.reply_text(
+                    "Не удалось обработать текст или ссылку. Попробуйте другой формат."
+                )
+                return
         except Exception as e:
             logger.error(f"Error while processing input text or URL: {e}")
             await message.reply_text(
@@ -269,9 +315,8 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             }
         ]
 
-        # >>> ВОТ ЗДЕСЬ БЫЛА ОШИБКА ТИПОВ <<<
         if history:
-            messages.extend(history[-max_history_messages:])  # type: ignore[arg-type]  # <<< CHANGED
+            messages.extend(history[-max_history_messages:])  # type: ignore[arg-type]
 
         # Если сохранено резюме — добавляем его как отдельное сообщение-контекст
         resume = user_data.get("resume")
@@ -333,7 +378,8 @@ def main() -> None:
     if not token:
         logger.error("TELEGRAM_BOT_TOKEN not found in environment variables!")
         print(
-            "ERROR: Please set your TELEGRAM_BOT_TOKEN environment variable.")
+            "ERROR: Please set your TELEGRAM_BOT_TOKEN environment variable."
+        )
         print("You can get a token from @BotFather on Telegram.")
         return
 
@@ -375,4 +421,3 @@ def main() -> None:
 
 if __name__ == '__main__':
     main()
-
