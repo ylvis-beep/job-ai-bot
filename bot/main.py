@@ -85,8 +85,12 @@ def extract_text_from_url(url: str) -> str:
     """
     Скачиваем страницу/файл по ссылке и вытаскиваем текст.
 
-    Если сайт отвечает 403 (Forbidden) — поднимаем специальную ошибка REMOTE_FORBIDDEN,
-    чтобы выше по стеку показать пользователю понятное сообщение.
+    ВАЖНО:
+    - никакие HTTPError наружу не вылетают;
+    - мы конвертим их в RuntimeError с кодами:
+        * REMOTE_FORBIDDEN      — сайт вернул 403;
+        * NETWORK_ERROR         — сетевые ошибки/таймауты;
+        * REMOTE_HTTP_ERROR_XYZ — другие HTTP-коды (404, 500 и т.п.).
     """
     headers = {
         "User-Agent": (
@@ -99,23 +103,24 @@ def extract_text_from_url(url: str) -> str:
     try:
         resp = requests.get(url, headers=headers, timeout=10)
         logger.info(f"Fetched URL {url} with status {resp.status_code}")
+        # Если статус уже не 2xx — сразу обрабатываем
+        if resp.status_code == 403:
+            logger.warning(f"Forbidden (403) while fetching {url}")
+            raise RuntimeError("REMOTE_FORBIDDEN")
+
+        if resp.status_code < 200 or resp.status_code >= 300:
+            code = resp.status_code
+            logger.error(f"Non-OK HTTP status {code} while fetching {url}")
+            raise RuntimeError(f"REMOTE_HTTP_ERROR_{code}")
+    except requests.Timeout as e:
+        logger.error(f"Timeout while fetching {url}: {e}")
+        raise RuntimeError("NETWORK_ERROR") from e
     except requests.RequestException as e:
+        # Любые другие сетевые ошибки
         logger.error(f"Network error while fetching {url}: {e}")
-        # даём понять наверх, что проблема с сетью/подключением
         raise RuntimeError("NETWORK_ERROR") from e
 
-    # сайт сознательно не даёт читать себя с нашего сервера
-    if resp.status_code == 403:
-        logger.warning(f"Forbidden (403) while fetching {url}")
-        raise RuntimeError("REMOTE_FORBIDDEN")
-
-    # остальные коды ошибок пусть превращаются в обычные HTTPError
-    try:
-        resp.raise_for_status()
-    except requests.HTTPError as e:
-        logger.error(f"HTTP error while fetching {url}: {e}")
-        raise
-
+    # Если мы здесь — статус 2xx, можно парсить
     content_type = resp.headers.get("Content-Type", "")
     if "pdf" in content_type.lower():
         return extract_text_from_pdf_bytes(resp.content)
@@ -260,12 +265,11 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         try:
             user_message = prepare_input_text(raw_text)
         except RuntimeError as e:
-            # наши спец-ошибки из extract_text_from_url
             code = str(e)
             if code == "REMOTE_FORBIDDEN":
                 await message.reply_text(
                     "Сайт по этой ссылке не разрешает автоматически считывать содержимое "
-                    "с моего сервера (отдаёт 403 Forbidden).\n\n"
+                    "с моего сервера (возвращает 403 Forbidden).\n\n"
                     "Пожалуйста, скопируйте текст вакансии и пришлите его сюда текстом."
                 )
                 return
@@ -273,6 +277,13 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 await message.reply_text(
                     "Не удалось подключиться к сайту по ссылке. "
                     "Попробуйте ещё раз позже или пришлите текст вакансии вручную."
+                )
+                return
+            elif code.startswith("REMOTE_HTTP_ERROR_"):
+                status = code.split("_")[-1]
+                await message.reply_text(
+                    f"Сайт по этой ссылке вернул ошибку {status} и не даёт автоматически получить текст.\n\n"
+                    "Пожалуйста, скопируйте текст вакансии и отправьте его сюда."
                 )
                 return
             else:
