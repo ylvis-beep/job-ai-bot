@@ -4,7 +4,7 @@ from typing import Any, Dict, List, cast
 import re
 import time
 import random
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 import requests
 from bs4 import BeautifulSoup
 from io import BytesIO
@@ -26,30 +26,24 @@ logger = logging.getLogger(__name__)
 openai_client = None
 
 
-def get_random_user_agent() -> str:
-    """Возвращает случайный User-Agent из списка."""
+def get_rotating_user_agent() -> str:
+    """Возвращает User-Agent с ротацией для обхода блокировок."""
     user_agents = [
-        # Chrome на Windows
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.6045.159 Safari/537.36",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36",
-        
-        # Chrome на Mac
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_14_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+        # Chrome последние версии
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         
         # Firefox
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:121.0) Gecko/20100101 Firefox/121.0",
-        "Mozilla/5.0 (X11; Linux x86_64; rv:120.0) Gecko/20100101 Firefox/120.0",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:122.0) Gecko/20100101 Firefox/122.0",
         
         # Safari
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_14_6) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.1.2 Safari/605.1.15",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3 Safari/605.1.15",
         
         # Edge
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36 Edg/119.0.0.0",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36 Edg/121.0.0.0",
     ]
     
     return random.choice(user_agents)
@@ -70,7 +64,7 @@ def load_system_prompt() -> str:
 
 
 # =========================
-# Парсинг текста / ссылок / PDF
+# Парсинг текста / ссылок / PDF - УЛУЧШЕННЫЙ
 # =========================
 
 def clean_text(raw: str) -> str:
@@ -91,11 +85,11 @@ def is_url(text: str) -> bool:
     text = text.strip()
     try:
         parsed = urlparse(text)
-        # Более строгая проверка для URL
-        return (parsed.scheme in ("http", "https") and 
-                bool(parsed.netloc) and 
-                '.' in parsed.netloc and
-                len(parsed.netloc) > 3)
+        # Более строгая проверка
+        has_scheme = parsed.scheme in ("http", "https", "")
+        has_netloc = bool(parsed.netloc)
+        has_dot = '.' in parsed.netloc if parsed.netloc else False
+        return has_scheme and has_netloc and has_dot
     except ValueError:
         return False
 
@@ -114,28 +108,40 @@ def extract_text_from_pdf_bytes(data: bytes) -> str:
         return ""
 
 
-def extract_text_from_url(url: str) -> str:
-    """
-    Скачиваем страницу/файл по ссылке и вытаскиваем текст.
+def extract_text_with_proxies(url: str) -> str:
+    """Пытаемся получить текст через разные методы с обходом блокировок."""
     
-    УЛУЧШЕННЫЙ ВАРИАНТ с обходом блокировок:
-    - Случайный User-Agent
-    - Полный набор заголовков браузера
-    - Задержка перед запросом
-    - Поддержка редиректов
-    - Обработка кодировки
-    """
-    # Случайный User-Agent для каждого запроса
+    strategies = [
+        _try_stealth_request,
+        _try_with_session,
+        _try_mobile_headers,
+        _try_with_referer_chain,
+    ]
+    
+    for strategy in strategies:
+        try:
+            result = strategy(url)
+            if result and len(result.strip()) > 100:  # Проверяем, что получили достаточно текста
+                logger.info(f"Strategy {strategy.__name__} succeeded for {url}")
+                return result
+        except Exception as e:
+            logger.debug(f"Strategy {strategy.__name__} failed: {e}")
+            continue
+    
+    # Если все стратегии провалились, пробуем простое извлечение
+    try:
+        return _try_simple_request(url)
+    except:
+        raise RuntimeError("UNABLE_TO_PARSE")
+
+
+def _try_stealth_request(url: str) -> str:
+    """Стелс-запрос с полным набором заголовков браузера."""
     headers = {
-        "User-Agent": get_random_user_agent(),
-        "Accept": (
-            "text/html,application/xhtml+xml,application/xml;"
-            "q=0.9,image/webp,image/apng,*/*;q=0.8,"
-            "application/signed-exchange;v=b3;q=0.7"
-        ),
-        "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7,uk;q=0.6,de;q=0.5",
+        "User-Agent": get_rotating_user_agent(),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+        "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7,uk;q=0.6",
         "Accept-Encoding": "gzip, deflate, br",
-        "DNT": "1",
         "Connection": "keep-alive",
         "Upgrade-Insecure-Requests": "1",
         "Sec-Fetch-Dest": "document",
@@ -144,108 +150,259 @@ def extract_text_from_url(url: str) -> str:
         "Sec-Fetch-User": "?1",
         "Cache-Control": "max-age=0",
         "Pragma": "no-cache",
-        "Referer": "https://www.google.com/",  # Добавляем реферер
     }
     
-    # Параметры для обхода блокировок
-    request_params = {
-        "headers": headers,
-        "timeout": 15,  # Увеличиваем таймаут
-        "allow_redirects": True,  # Разрешаем редиректы
-        "verify": True,  # Проверяем SSL
-        "stream": False,  # Не использовать stream для простых запросов
-    }
+    # Добавляем заголовки для обхода Cloudflare
+    headers.update({
+        "sec-ch-ua": '"Google Chrome";v="121", "Not A Brand";v="99", "Chromium";v="121"',
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": '"Windows"',
+    })
+    
+    # Случайный реферер
+    referers = [
+        "https://www.google.com/",
+        "https://yandex.ru/",
+        "https://www.bing.com/",
+        f"https://{urlparse(url).netloc}/"
+    ]
+    headers["Referer"] = random.choice(referers)
+    
+    time.sleep(random.uniform(1, 3))
+    
+    session = requests.Session()
+    session.headers.update(headers)
     
     try:
-        # Небольшая случайная задержка (имитация поведения человека)
-        time.sleep(random.uniform(0.5, 2.0))
+        response = session.get(url, timeout=25, allow_redirects=True, verify=True)
         
-        logger.info(f"Fetching URL: {url} with User-Agent: {headers['User-Agent'][:50]}...")
+        if response.status_code == 200:
+            return _extract_content(response, url)
+        elif response.status_code == 403:
+            # Пробуем с другими заголовками
+            time.sleep(2)
+            alt_headers = headers.copy()
+            alt_headers["User-Agent"] = get_rotating_user_agent()
+            alt_headers["Accept"] = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+            
+            response2 = session.get(url, headers=alt_headers, timeout=25)
+            if response2.status_code == 200:
+                return _extract_content(response2, url)
         
-        resp = requests.get(url, **request_params)
-        logger.info(f"Fetched URL {url} with status {resp.status_code}")
+        response.raise_for_status()
+        return _extract_content(response, url)
         
-        # Если статус уже не 2xx — сразу обрабатываем
-        if resp.status_code == 403:
-            logger.warning(f"Forbidden (403) while fetching {url}")
-            raise RuntimeError("REMOTE_FORBIDDEN")
-        
-        if resp.status_code == 429:
-            logger.warning(f"Too Many Requests (429) while fetching {url}")
-            raise RuntimeError("REMOTE_HTTP_ERROR_429")
+    finally:
+        session.close()
 
-        if resp.status_code < 200 or resp.status_code >= 300:
-            code = resp.status_code
-            logger.error(f"Non-OK HTTP status {code} while fetching {url}")
-            raise RuntimeError(f"REMOTE_HTTP_ERROR_{code}")
-    
-    except requests.Timeout as e:
-        logger.error(f"Timeout while fetching {url}: {e}")
-        raise RuntimeError("NETWORK_ERROR") from e
-    except requests.TooManyRedirects as e:
-        logger.error(f"Too many redirects for {url}: {e}")
-        raise RuntimeError("NETWORK_ERROR") from e
-    except requests.RequestException as e:
-        # Любые другие сетевые ошибки
-        logger.error(f"Network error while fetching {url}: {e}")
-        raise RuntimeError("NETWORK_ERROR") from e
 
-    # Если мы здесь — статус 2xx, можно парсить
-    content_type = resp.headers.get("Content-Type", "").lower()
+def _try_with_session(url: str) -> str:
+    """Использование сессии с куками."""
+    session = requests.Session()
     
-    # Пробуем определить кодировку если не указана
-    if not resp.encoding:
+    # Инициализируем сессию
+    init_headers = {
+        "User-Agent": get_rotating_user_agent(),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    }
+    
+    session.headers.update(init_headers)
+    
+    try:
+        # Сначала получаем главную страницу для установки куков
+        parsed = urlparse(url)
+        base_url = f"{parsed.scheme}://{parsed.netloc}"
+        
         try:
-            # Простая проверка на UTF-8
-            resp.content.decode('utf-8')
-            resp.encoding = 'utf-8'
-        except UnicodeDecodeError:
-            # Пробуем другие кодировки
-            try:
-                resp.content.decode('cp1251')
-                resp.encoding = 'cp1251'
-            except:
-                resp.encoding = 'utf-8'  # По умолчанию
+            session.get(base_url, timeout=10, allow_redirects=True)
+            time.sleep(1)
+        except:
+            pass  # Игнорируем ошибки при получении главной страницы
+        
+        # Теперь запрашиваем нужную страницу
+        time.sleep(random.uniform(0.5, 2))
+        
+        headers = {
+            "Referer": base_url,
+            "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+        }
+        
+        response = session.get(url, headers=headers, timeout=20, allow_redirects=True)
+        
+        if response.status_code == 200:
+            return _extract_content(response, url)
+        
+        response.raise_for_status()
+        return _extract_content(response, url)
+        
+    finally:
+        session.close()
+
+
+def _try_mobile_headers(url: str) -> str:
+    """Использование мобильных заголовков."""
+    mobile_agents = [
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1",
+        "Mozilla/5.0 (Linux; Android 13; SM-S901B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Mobile Safari/537.36",
+        "Mozilla/5.0 (Linux; Android 13; SM-G991B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Mobile Safari/537.36",
+    ]
     
-    # Обработка PDF
-    if "pdf" in content_type:
-        return extract_text_from_pdf_bytes(resp.content)
+    headers = {
+        "User-Agent": random.choice(mobile_agents),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+        "X-Requested-With": "XMLHttpRequest",
+    }
     
-    # Обработка HTML
+    time.sleep(random.uniform(1, 2))
+    
+    response = requests.get(url, headers=headers, timeout=20, allow_redirects=True)
+    
+    if response.status_code == 200:
+        return _extract_content(response, url)
+    
+    response.raise_for_status()
+    return _extract_content(response, url)
+
+
+def _try_with_referer_chain(url: str) -> str:
+    """Цепочка запросов с реферерами."""
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": get_rotating_user_agent(),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    })
+    
     try:
-        # Используем 'html.parser' для надежности (не требует lxml)
-        soup = BeautifulSoup(resp.content, "html.parser", from_encoding=resp.encoding)
+        # Имитируем навигацию
+        referer_chain = [
+            "https://www.google.com/search?q=" + "+".join(urlparse(url).netloc.split('.')[:2]),
+            f"https://{urlparse(url).netloc}/",
+        ]
+        
+        for referer in referer_chain:
+            try:
+                session.get(referer, timeout=5)
+                time.sleep(random.uniform(0.5, 1.5))
+            except:
+                pass
+        
+        time.sleep(random.uniform(1, 2))
+        
+        response = session.get(url, timeout=20, allow_redirects=True)
+        
+        if response.status_code == 200:
+            return _extract_content(response, url)
+        
+        response.raise_for_status()
+        return _extract_content(response, url)
+        
+    finally:
+        session.close()
+
+
+def _try_simple_request(url: str) -> str:
+    """Простой запрос как запасной вариант."""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    }
+    
+    response = requests.get(url, headers=headers, timeout=15, allow_redirects=True)
+    response.raise_for_status()
+    return _extract_content(response, url)
+
+
+def _extract_content(response, url: str) -> str:
+    """Извлечение контента из ответа."""
+    content_type = response.headers.get("Content-Type", "").lower()
+    
+    # PDF
+    if "pdf" in content_type:
+        return extract_text_from_pdf_bytes(response.content)
+    
+    # HTML
+    try:
+        # Пробуем разные кодировки
+        encodings_to_try = ['utf-8', 'cp1251', 'koi8-r', 'iso-8859-1']
+        
+        for encoding in encodings_to_try:
+            try:
+                soup = BeautifulSoup(response.content.decode(encoding, errors='ignore'), 'html.parser')
+                break
+            except:
+                continue
+        else:
+            soup = BeautifulSoup(response.content, 'html.parser')
         
         # Удаляем ненужные элементы
-        for element in soup(["script", "style", "nav", "footer", "header", 
-                           "aside", "form", "iframe", "noscript"]):
+        for element in soup(["script", "style", "noscript", "iframe", "svg", "meta", "link"]):
             element.decompose()
         
-        # Получаем основной контент
-        # Сначала ищем article, main, или div с контентом
-        main_content = soup.find('article') or soup.find('main') or soup.find('div', class_=re.compile(r'content|post|article|text', re.I))
+        # Ищем основной контент
+        content_selectors = [
+            # Вакансии
+            '[class*="vacancy"]', '[class*="job"]', '[class*="description"]',
+            'article', 'main', '.content', '.post-content',
+            '[class*="content"]', '[class*="text"]', '[class*="body"]',
+            # Общие
+            '#content', '.main-content', '.page-content',
+            '.entry-content', '.post-body', '.article-body'
+        ]
         
-        if main_content:
-            body = main_content
-        else:
-            body = soup.body or soup
+        content_element = None
+        for selector in content_selectors:
+            try:
+                element = soup.select_one(selector)
+                if element and len(element.get_text(strip=True)) > 200:
+                    content_element = element
+                    break
+            except:
+                continue
         
-        # Получаем текст с сохранением структуры
-        text = body.get_text(separator="\n", strip=True)
+        if not content_element:
+            content_element = soup.find('body') or soup
         
-        # Дополнительная очистка
-        text = re.sub(r'\s*\n\s*\n\s*', '\n\n', text)  # Убираем лишние пустые строки
-        text = re.sub(r'[ \t]+', ' ', text)  # Заменяем множественные пробелы
+        # Получаем текст
+        text = content_element.get_text(separator='\n', strip=True)
+        
+        # Очистка
+        text = re.sub(r'\n\s*\n\s*\n+', '\n\n', text)
+        text = re.sub(r'[ \t]{2,}', ' ', text)
+        
+        # Удаляем короткие строки если их много
+        lines = [line.strip() for line in text.split('\n') if line.strip()]
+        if len(lines) > 30:
+            lines = [line for line in lines if len(line) > 20]
+        
+        text = '\n'.join(lines)
+        
+        if len(text) < 100:
+            logger.warning(f"Extracted text too short from {url}: {len(text)} chars")
         
         return clean_text(text)
-    
+        
     except Exception as e:
-        logger.error(f"Error parsing HTML from {url}: {e}")
-        # В случае ошибки парсинга, пробуем просто получить весь текст
-        try:
-            return clean_text(resp.text)
-        except:
-            raise RuntimeError("PARSING_ERROR")
+        logger.error(f"Error extracting content from {url}: {e}")
+        raise
+
+
+def extract_text_from_url(url: str) -> str:
+    """
+    Основная функция для извлечения текста из URL.
+    Пробует несколько стратегий обхода блокировок.
+    """
+    logger.info(f"Attempting to parse URL: {url}")
+    
+    # Нормализуем URL
+    if not url.startswith(('http://', 'https://')):
+        url = 'https://' + url
+    
+    try:
+        return extract_text_with_proxies(url)
+    except Exception as e:
+        logger.warning(f"All parsing strategies failed for {url}: {e}")
+        raise RuntimeError("UNABLE_TO_PARSE")
 
 
 def prepare_input_text(raw: str) -> str:
@@ -253,24 +410,41 @@ def prepare_input_text(raw: str) -> str:
     Универсальная функция:
     - если строка целиком — ссылка, скачиваем и чистим,
     - если текст — просто чистим.
+    
+    В случае ошибок парсинга - возвращаем исходный текст (ссылку),
+    чтобы GPT сам мог попробовать понять, что это за вакансия.
     """
     if not raw:
         return ""
+    
     raw = raw.strip()
-    if is_url(raw):
-        logger.info(f"Detected URL message: {raw}")
-        try:
-            return extract_text_from_url(raw)
-        except RuntimeError as e:
-            # Пробуем добавить https:// если его нет
-            if not raw.startswith(('http://', 'https://')):
-                try:
-                    return extract_text_from_url('https://' + raw)
-                except:
-                    raise e
-            else:
-                raise e
-    return clean_text(raw)
+    
+    # Если это явно не ссылка, просто чистим текст
+    if not is_url(raw):
+        return clean_text(raw)
+    
+    # Если это ссылка - пробуем парсить
+    logger.info(f"Detected URL message: {raw}")
+    
+    try:
+        text = extract_text_from_url(raw)
+        if text and len(text.strip()) > 100:
+            return text
+        else:
+            # Если текст слишком короткий, возможно, парсинг не удался
+            logger.warning(f"Parsed text too short, returning original URL")
+            return clean_text(raw)  # Возвращаем очищенную ссылку
+    except RuntimeError as e:
+        if str(e) == "UNABLE_TO_PARSE":
+            logger.info(f"Could not parse URL {raw}, returning URL as text")
+            # Возвращаем ссылку как текст - GPT сам попробует понять
+            return clean_text(f"Ссылка на вакансию: {raw}")
+        else:
+            raise e
+    except Exception as e:
+        logger.error(f"Unexpected error parsing URL {raw}: {e}")
+        # В случае любой другой ошибки возвращаем ссылку как текст
+        return clean_text(f"Ссылка на вакансию: {raw}")
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -319,7 +493,7 @@ async def help_command(update: Update,
 Поддерживаемые форматы:
 - Текст (просто отправьте текст)
 - PDF файлы
-- Ссылки на вакансии (большинство сайтов)
+- Ссылки на вакансии (я постараюсь их обработать)
 
     """
     await message.reply_text(help_text)
@@ -394,63 +568,16 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if raw_text is None:
             await message.reply_text("Я могу обрабатывать только текст или PDF-файлы.")
             return
+        
+        # Показываем, что бот работает
+        await message.chat.send_action(action="typing")
+        
         try:
             user_message = prepare_input_text(raw_text)
-        except RuntimeError as e:
-            code = str(e)
-            if code == "REMOTE_FORBIDDEN":
-                await message.reply_text(
-                    "⚠️ Сайт заблокировал доступ с моего сервера (ошибка 403 Forbidden).\n\n"
-                    "🔹 **Что можно сделать:**\n"
-                    "1. Скопируйте текст вакансии и пришлите его сюда текстом\n"
-                    "2. Попробуйте другую ссылку\n"
-                    "3. Используйте PDF версию вакансии\n\n"
-                    "Некоторые сайты (особенно с hh.ru, rabota.ru) защищают свои страницы от автоматического парсинга."
-                )
-                return
-            elif code == "REMOTE_HTTP_ERROR_429":
-                await message.reply_text(
-                    "⚠️ Сайт ограничил количество запросов (Too Many Requests).\n\n"
-                    "Пожалуйста, подождите 1-2 минуты и попробуйте снова, "
-                    "или скопируйте текст вакансии вручную."
-                )
-                return
-            elif code == "NETWORK_ERROR":
-                await message.reply_text(
-                    "⚠️ Не удалось подключиться к сайту по ссылке.\n\n"
-                    "🔹 **Возможные причины:**\n"
-                    "1. Сайт временно недоступен\n"
-                    "2. Проблемы с сетью\n"
-                    "3. Неверная ссылка\n\n"
-                    "Попробуйте ещё раз позже или пришлите текст вакансии вручную."
-                )
-                return
-            elif code.startswith("REMOTE_HTTP_ERROR_"):
-                status = code.split("_")[-1]
-                await message.reply_text(
-                    f"⚠️ Сайт вернул ошибку {status}.\n\n"
-                    "Пожалуйста, скопируйте текст вакансии и отправьте его сюда текстом, "
-                    "или проверьте правильность ссылки."
-                )
-                return
-            elif code == "PARSING_ERROR":
-                await message.reply_text(
-                    "⚠️ Не удалось обработать содержимое страницы.\n\n"
-                    "Пожалуйста, скопируйте текст вакансии и отправьте его сюда."
-                )
-                return
-            else:
-                logger.error(f"Runtime error while processing input text or URL: {e}")
-                await message.reply_text(
-                    "❌ Не удалось обработать текст или ссылку. Попробуйте другой формат."
-                )
-                return
         except Exception as e:
             logger.error(f"Error while processing input text or URL: {e}")
-            await message.reply_text(
-                "❌ Не удалось обработать текст или ссылку. Попробуйте другой формат."
-            )
-            return
+            # В тихом режиме не показываем ошибки, просто используем исходный текст
+            user_message = clean_text(raw_text)
 
     # Если ожидаем новое резюме после /update_resume — сохраняем его и не вызываем OpenAI
     if user_data.get("awaiting_resume"):
@@ -521,8 +648,9 @@ async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     except Exception as e:
         logger.error(f"Error calling OpenAI API: {e}")
+        # В тихом режиме показываем общее сообщение
         await message.reply_text(
-            "Sorry, I encountered an error processing your message. Please try again."
+            "Произошла ошибка при обработке запроса. Пожалуйста, попробуйте ещё раз."
         )
 
 
