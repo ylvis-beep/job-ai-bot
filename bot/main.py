@@ -28,8 +28,16 @@ DEFAULT_HEADERS = {  # <<< ADDED
     "User-Agent": (  # <<< ADDED
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "  # <<< ADDED
         "AppleWebKit/537.36 (KHTML, like Gecko) "  # <<< ADDED
-        "Chrome/120.0.0.0 Safari/537.36"  # <<< ADDED
-    )  # <<< ADDED
+        "Chrome/125.0.0.0 Safari/537.36"  # <<< ADDED
+    ),  # <<< ADDED
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",  # <<< ADDED
+    "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",  # <<< ADDED
+    "Cache-Control": "no-cache",  # <<< ADDED
+    "Pragma": "no-cache",  # <<< ADDED
+    "Upgrade-Insecure-Requests": "1",  # <<< ADDED
+    "Sec-Ch-Ua": '"Chromium";v="125", "Not.A/Brand";v="24", "Google Chrome";v="125"',  # <<< ADDED
+    "Sec-Ch-Ua-Mobile": "?0",  # <<< ADDED
+    "Sec-Ch-Ua-Platform": '"macOS"',  # <<< ADDED
 }  # <<< ADDED
 
 MIN_MEANINGFUL_TEXT_LENGTH = 400  # <<< ADDED
@@ -122,6 +130,68 @@ def _jina_reader(url: str) -> str:  # <<< ADDED
     return clean_text(html)  # <<< ADDED
 
 
+def _looks_like_captcha(html: str) -> bool:  # <<< ADDED
+    """Грубая эвристика: похоже ли содержимое на капчу/блокировку."""  # <<< ADDED
+    if not html:  # <<< ADDED
+        return False  # <<< ADDED
+    lowered = html.lower()  # <<< ADDED
+    captcha_markers = [  # <<< ADDED
+        "captcha",  # <<< ADDED
+        "cloudflare",  # <<< ADDED
+        "attention required",  # <<< ADDED
+        "are you human",  # <<< ADDED
+        "access denied",  # <<< ADDED
+    ]  # <<< ADDED
+    return any(marker in lowered for marker in captcha_markers)  # <<< ADDED
+
+
+def _playwright_render(url: str) -> str:  # <<< ADDED
+    """Рендер страницы как реальным браузером, чтобы получить JS-контент."""  # <<< ADDED
+    try:  # <<< ADDED
+        from playwright.sync_api import sync_playwright  # type: ignore  # <<< ADDED
+    except Exception as exc:  # <<< ADDED
+        logger.error("Playwright is unavailable: %s", exc)  # <<< ADDED
+        return ""  # <<< ADDED
+
+    browser = None  # <<< ADDED
+    context = None  # <<< ADDED
+    try:  # <<< ADDED
+        with sync_playwright() as p:  # <<< ADDED
+            browser = p.chromium.launch(  # <<< ADDED
+                headless=True,  # <<< ADDED
+                args=["--disable-blink-features=AutomationControlled"],  # <<< ADDED
+            )  # <<< ADDED
+            context = browser.new_context(  # <<< ADDED
+                user_agent=DEFAULT_HEADERS["User-Agent"],  # <<< ADDED
+                viewport={"width": 1365, "height": 768},  # <<< ADDED
+                locale="ru-RU",  # <<< ADDED
+                java_script_enabled=True,  # <<< ADDED
+                extra_http_headers=DEFAULT_HEADERS,  # <<< ADDED
+            )  # <<< ADDED
+            page = context.new_page()  # <<< ADDED
+            page.goto(url, wait_until="networkidle", timeout=40000)  # <<< ADDED
+            page.wait_for_timeout(3000)  # подождём JS  # <<< ADDED
+            html = page.content()  # <<< ADDED
+            if _looks_like_captcha(html):  # <<< ADDED
+                logger.warning("Captcha or block page detected when rendering %s", url)  # <<< ADDED
+            logger.info("Playwright rendered %s (len=%s)", url, len(html))  # <<< ADDED
+            return html  # <<< ADDED
+    except Exception as exc:  # <<< ADDED
+        logger.error("Playwright failed for %s: %s", url, exc, exc_info=True)  # <<< ADDED
+        return ""  # <<< ADDED
+    finally:  # <<< ADDED
+        try:  # <<< ADDED
+            if context is not None:  # <<< ADDED
+                context.close()  # <<< ADDED
+        except Exception:  # <<< ADDED
+            logger.debug("Failed to close Playwright context", exc_info=True)  # <<< ADDED
+        try:  # <<< ADDED
+            if browser is not None:  # <<< ADDED
+                browser.close()  # <<< ADDED
+        except Exception:  # <<< ADDED
+            logger.debug("Failed to close Playwright browser", exc_info=True)  # <<< ADDED
+
+
 def extract_text_from_url(url: str) -> str:  # <<< ADDED
     """Скачиваем страницу/файл по ссылке и вытаскиваем текст."""  # <<< ADDED
     html, content_type, content = _fetch_url_content(url)  # <<< ADDED
@@ -138,14 +208,23 @@ def extract_text_from_url(url: str) -> str:  # <<< ADDED
     if primary_text:  # <<< ADDED
         candidates.append(primary_text)  # <<< ADDED
 
-    # Tochka защищается от простых запросов, поэтому сразу используем Jina Reader.  # <<< ADDED
+    # Tochka защищается от простых запросов, поэтому сначала пробуем Playwright.  # <<< ADDED
     if host == "tochka.com":  # <<< ADDED
-        jina_text = _jina_reader(url)  # <<< ADDED
-        if jina_text:  # <<< ADDED
-            logger.info(
-                "Using Jina Reader fallback for tochka.com (len=%s)", len(jina_text)
-            )  # <<< ADDED
-            candidates.insert(0, jina_text)  # <<< ADDED
+        playwright_html = _playwright_render(url)  # <<< ADDED
+        if playwright_html:  # <<< ADDED
+            playwright_text = _html_to_text(playwright_html)  # <<< ADDED
+            if playwright_text:  # <<< ADDED
+                candidates.insert(0, playwright_text)  # <<< ADDED
+        else:  # <<< ADDED
+            logger.warning("Playwright returned empty HTML for %s", url)  # <<< ADDED
+
+        if not candidates or not _is_meaningful(candidates[0]):  # <<< ADDED
+            jina_text = _jina_reader(url)  # <<< ADDED
+            if jina_text:  # <<< ADDED
+                logger.info(
+                    "Using Jina Reader fallback for tochka.com (len=%s)", len(jina_text)
+                )  # <<< ADDED
+                candidates.insert(0, jina_text)  # <<< ADDED
     elif not _is_meaningful(primary_text):  # <<< ADDED
         jina_text = _jina_reader(url)  # <<< ADDED
         if jina_text:  # <<< ADDED
