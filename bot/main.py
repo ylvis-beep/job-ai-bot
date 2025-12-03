@@ -1,6 +1,6 @@
 import os
 import logging
-from typing import Any, Dict, List, cast  # <<< ADDED
+from typing import Any, Dict, List, Optional, Tuple, cast  # <<< ADDED
 import re  # <<< ADDED
 from urllib.parse import urlparse  # <<< ADDED
 import requests  # <<< ADDED
@@ -17,12 +17,50 @@ from openai.types.chat import ChatCompletionMessageParam  # <<< ADDED
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO)
+logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 # Initialize OpenAI client
 # the newest OpenAI model is "gpt-4.1-mini" which was released June 2024.  # <<< CHANGED
 # do not change this unless explicitly requested by the user
 openai_client = None
+
+DEFAULT_HEADERS = {  # <<< ADDED
+    "User-Agent": (  # <<< ADDED
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "  # <<< ADDED
+        "AppleWebKit/537.36 (KHTML, like Gecko) "  # <<< ADDED
+        "Chrome/125.0.0.0 Safari/537.36"  # <<< ADDED
+    ),  # <<< ADDED
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",  # <<< ADDED
+    "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",  # <<< ADDED
+    "Cache-Control": "no-cache",  # <<< ADDED
+    "Pragma": "no-cache",  # <<< ADDED
+    "Upgrade-Insecure-Requests": "1",  # <<< ADDED
+    "Sec-Ch-Ua": '"Chromium";v="125", "Not.A/Brand";v="24", "Google Chrome";v="125"',  # <<< ADDED
+    "Sec-Ch-Ua-Mobile": "?0",  # <<< ADDED
+    "Sec-Ch-Ua-Platform": '"macOS"',  # <<< ADDED
+}  # <<< ADDED
+
+MIN_MEANINGFUL_TEXT_LENGTH = 400  # <<< ADDED
+
+
+SCRAPINGBEE_API_KEY = os.getenv("SCRAPINGBEE_API_KEY")
+
+
+def fetch_html_with_scrapingbee(url: str) -> str:
+    if not SCRAPINGBEE_API_KEY:
+        raise RuntimeError("SCRAPINGBEE_API_KEY is not set")
+
+    api_endpoint = "https://app.scrapingbee.com/api/v1"
+    params = {
+        "api_key": SCRAPINGBEE_API_KEY,
+        "url": url,
+        # "render_js": "true",
+    }
+
+    resp = requests.get(api_endpoint, params=params, timeout=30)
+    resp.raise_for_status()
+    return resp.text
 
 
 def load_system_prompt() -> str:  # <<< ADDED
@@ -80,27 +118,171 @@ def extract_text_from_pdf_bytes(data: bytes) -> str:  # <<< ADDED
         return ""  # <<< ADDED
 
 
-def extract_text_from_url(url: str) -> str:  # <<< ADDED
-    """Скачиваем страницу/файл по ссылке и вытаскиваем текст."""  # <<< ADDED
-    headers = {  # <<< ADDED
-        "User-Agent": (  # <<< ADDED
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0.0.0 Safari/537.36"
-        )
-    }
+def _fetch_url_content(url: str) -> Tuple[Optional[str], str, bytes]:  # <<< ADDED
+    """Возвращает текст, content-type и байты ответа или (None, "", b"")."""  # <<< ADDED
+    try:  # <<< ADDED
+        scraped_html: Optional[str] = None
+        try:
+            scraped_html = fetch_html_with_scrapingbee(url)
+        except RuntimeError:
+            logger.debug("SCRAPINGBEE_API_KEY is not set; skipping ScrapingBee fetch")
+        except Exception as exc:
+            logger.warning("ScrapingBee request failed for %s: %s", url, exc)
 
-    resp = requests.get(url, headers=headers, timeout=10)  # <<< ADDED
-    resp.raise_for_status()  # <<< ADDED
+        if scraped_html:
+            return scraped_html, "text/html", scraped_html.encode("utf-8", errors="ignore")
 
-    content_type = resp.headers.get("Content-Type", "")  # <<< ADDED
-    if "pdf" in content_type.lower():  # <<< ADDED
-        return extract_text_from_pdf_bytes(resp.content)  # <<< ADDED
+        resp = requests.get(url, headers=DEFAULT_HEADERS, timeout=20)  # <<< ADDED
+        resp.raise_for_status()  # <<< ADDED
+        return resp.text, resp.headers.get("Content-Type", ""), resp.content  # <<< ADDED
+    except Exception as exc:  # <<< ADDED
+        logger.warning(f"Failed to fetch {url}: {exc}")  # <<< ADDED
+        return None, "", b""  # <<< ADDED
 
-    soup = BeautifulSoup(resp.text, "html.parser")  # <<< ADDED
+
+def _html_to_text(html: str) -> str:  # <<< ADDED
+    soup = BeautifulSoup(html, "html.parser")  # <<< ADDED
     body = soup.body or soup  # <<< ADDED
     text = body.get_text(separator="\n")  # <<< ADDED
     return clean_text(text)  # <<< ADDED
+
+
+def _is_meaningful(text: str) -> bool:  # <<< ADDED
+    return len(text) >= MIN_MEANINGFUL_TEXT_LENGTH  # <<< ADDED
+
+
+def _jina_reader(url: str) -> str:  # <<< ADDED
+    jina_url = f"https://r.jina.ai/{url}"  # <<< ADDED
+    html, content_type, content = _fetch_url_content(jina_url)  # <<< ADDED
+    if not html:  # <<< ADDED
+        return ""  # <<< ADDED
+    if "pdf" in content_type.lower():  # <<< ADDED
+        return extract_text_from_pdf_bytes(content)  # <<< ADDED
+    return clean_text(html)  # <<< ADDED
+
+
+def _looks_like_captcha(html: str) -> bool:  # <<< ADDED
+    """Грубая эвристика: похоже ли содержимое на капчу/блокировку."""  # <<< ADDED
+    if not html:  # <<< ADDED
+        return False  # <<< ADDED
+    lowered = html.lower()  # <<< ADDED
+    captcha_markers = [  # <<< ADDED
+        "captcha",  # <<< ADDED
+        "cloudflare",  # <<< ADDED
+        "attention required",  # <<< ADDED
+        "are you human",  # <<< ADDED
+        "access denied",  # <<< ADDED
+    ]  # <<< ADDED
+    return any(marker in lowered for marker in captcha_markers)  # <<< ADDED
+
+
+def _playwright_render(url: str) -> str:  # <<< ADDED
+    """Рендер страницы как реальным браузером, чтобы получить JS-контент."""  # <<< ADDED
+    try:  # <<< ADDED
+        from playwright.sync_api import sync_playwright  # type: ignore  # <<< ADDED
+    except Exception as exc:  # <<< ADDED
+        logger.error("Playwright is unavailable: %s", exc)  # <<< ADDED
+        return ""  # <<< ADDED
+
+    browser = None  # <<< ADDED
+    context = None  # <<< ADDED
+    try:  # <<< ADDED
+        with sync_playwright() as p:  # <<< ADDED
+            browser = p.chromium.launch(  # <<< ADDED
+                headless=True,  # <<< ADDED
+                args=["--disable-blink-features=AutomationControlled"],  # <<< ADDED
+            )  # <<< ADDED
+            context = browser.new_context(  # <<< ADDED
+                user_agent=DEFAULT_HEADERS["User-Agent"],  # <<< ADDED
+                viewport={"width": 1365, "height": 768},  # <<< ADDED
+                locale="ru-RU",  # <<< ADDED
+                java_script_enabled=True,  # <<< ADDED
+                extra_http_headers=DEFAULT_HEADERS,  # <<< ADDED
+            )  # <<< ADDED
+            page = context.new_page()  # <<< ADDED
+            page.goto(url, wait_until="networkidle", timeout=40000)  # <<< ADDED
+            page.wait_for_timeout(3000)  # подождём JS  # <<< ADDED
+            html = page.content()  # <<< ADDED
+            if _looks_like_captcha(html):  # <<< ADDED
+                logger.warning("Captcha or block page detected when rendering %s", url)  # <<< ADDED
+            logger.info("Playwright rendered %s (len=%s)", url, len(html))  # <<< ADDED
+            return html  # <<< ADDED
+    except Exception as exc:  # <<< ADDED
+        logger.error("Playwright failed for %s: %s", url, exc, exc_info=True)  # <<< ADDED
+        return ""  # <<< ADDED
+    finally:  # <<< ADDED
+        try:  # <<< ADDED
+            if context is not None:  # <<< ADDED
+                context.close()  # <<< ADDED
+        except Exception:  # <<< ADDED
+            logger.debug("Failed to close Playwright context", exc_info=True)  # <<< ADDED
+        try:  # <<< ADDED
+            if browser is not None:  # <<< ADDED
+                browser.close()  # <<< ADDED
+        except Exception:  # <<< ADDED
+            logger.debug("Failed to close Playwright browser", exc_info=True)  # <<< ADDED
+
+
+def fetch_job_page_html(url: str) -> str:
+    if "tochka.com" in url:
+        logger.info("ScrapingBee: fetching %s", url)
+        try:
+            return fetch_html_with_scrapingbee(url)
+        except Exception as exc:
+            logger.error("ScrapingBee failed for %s: %s", url, exc)
+            return ""
+
+    logger.info("Playwright: fetching %s", url)
+    return _playwright_render(url)
+
+
+def extract_text_from_url(url: str) -> str:  # <<< ADDED
+    """Скачиваем страницу/файл по ссылке и вытаскиваем текст."""  # <<< ADDED
+    html, content_type, content = _fetch_url_content(url)  # <<< ADDED
+    parsed = urlparse(url)  # <<< ADDED
+    host = parsed.netloc.lower()  # <<< ADDED
+    if host.startswith("www."):  # <<< ADDED
+        host = host[4:]  # <<< ADDED
+
+    if "pdf" in content_type.lower():  # <<< ADDED
+        return extract_text_from_pdf_bytes(content)  # <<< ADDED
+
+    primary_text = _html_to_text(html) if html else ""  # <<< ADDED
+    candidates: List[str] = []  # <<< ADDED
+    if primary_text:  # <<< ADDED
+        candidates.append(primary_text)  # <<< ADDED
+
+    # Tochka защищается от простых запросов, поэтому сначала пробуем ScrapingBee.  # <<< ADDED
+    if host == "tochka.com":  # <<< ADDED
+        tochka_html = fetch_job_page_html(url)
+        if tochka_html:
+            soup = BeautifulSoup(tochka_html, "html.parser")
+            tochka_text = clean_text(soup.get_text("\n"))
+            if tochka_text:
+                candidates.insert(0, tochka_text)
+        else:  # <<< ADDED
+            logger.warning("ScrapingBee returned empty HTML for %s", url)  # <<< ADDED
+
+        if not candidates or not _is_meaningful(candidates[0]):  # <<< ADDED
+            jina_text = _jina_reader(url)  # <<< ADDED
+            if jina_text:  # <<< ADDED
+                logger.info(
+                    "Using Jina Reader fallback for tochka.com (len=%s)", len(jina_text)
+                )  # <<< ADDED
+                candidates.insert(0, jina_text)  # <<< ADDED
+    elif not _is_meaningful(primary_text):  # <<< ADDED
+        jina_text = _jina_reader(url)  # <<< ADDED
+        if jina_text:  # <<< ADDED
+            logger.info(
+                "Primary fetch too short (len=%s), using Jina Reader", len(primary_text)
+            )  # <<< ADDED
+            candidates.append(jina_text)  # <<< ADDED
+
+    for text in candidates:  # <<< ADDED
+        if _is_meaningful(text):  # <<< ADDED
+            return text  # <<< ADDED
+
+    return candidates[0] if candidates else ""  # <<< ADDED
 
 
 def prepare_input_text(raw: str) -> str:  # <<< ADDED
