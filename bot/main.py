@@ -43,6 +43,26 @@ DEFAULT_HEADERS = {  # <<< ADDED
 MIN_MEANINGFUL_TEXT_LENGTH = 400  # <<< ADDED
 
 
+def fetch_html_with_scrapingbee(url: str, render_js: bool = True) -> Optional[str]:
+    """Fetch HTML via ScrapingBee using the API key from env."""
+    api_key = os.getenv("SCRAPINGBEE_API_KEY")
+    if not api_key:
+        logger.warning("SCRAPINGBEE_API_KEY is not set; skipping ScrapingBee fetch for %s", url)
+        return None
+
+    params = {"api_key": api_key, "url": url}
+    if render_js:
+        params["render_js"] = "true"
+
+    try:
+        resp = requests.get("https://app.scrapingbee.com/api/v1", params=params, timeout=60)
+        resp.raise_for_status()
+        return resp.text
+    except Exception as exc:
+        logger.error("ScrapingBee request failed for %s: %s", url, exc)
+        return None
+
+
 def load_system_prompt() -> str:  # <<< ADDED
     """Load the system prompt from system_prompt.txt if it exists."""  # <<< ADDED
     try:  # <<< ADDED
@@ -101,6 +121,10 @@ def extract_text_from_pdf_bytes(data: bytes) -> str:  # <<< ADDED
 def _fetch_url_content(url: str) -> Tuple[Optional[str], str, bytes]:  # <<< ADDED
     """Возвращает текст, content-type и байты ответа или (None, "", b"")."""  # <<< ADDED
     try:  # <<< ADDED
+        scraped_html = fetch_html_with_scrapingbee(url)
+        if scraped_html:
+            return scraped_html, "text/html", scraped_html.encode("utf-8", errors="ignore")
+
         resp = requests.get(url, headers=DEFAULT_HEADERS, timeout=20)  # <<< ADDED
         resp.raise_for_status()  # <<< ADDED
         return resp.text, resp.headers.get("Content-Type", ""), resp.content  # <<< ADDED
