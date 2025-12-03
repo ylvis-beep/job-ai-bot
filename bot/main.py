@@ -17,6 +17,7 @@ from openai.types.chat import ChatCompletionMessageParam  # <<< ADDED
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO)
+logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 # Initialize OpenAI client
@@ -43,24 +44,23 @@ DEFAULT_HEADERS = {  # <<< ADDED
 MIN_MEANINGFUL_TEXT_LENGTH = 400  # <<< ADDED
 
 
-def fetch_html_with_scrapingbee(url: str, render_js: bool = True) -> Optional[str]:
-    """Fetch HTML via ScrapingBee using the API key from env."""
-    api_key = os.getenv("SCRAPINGBEE_API_KEY")
-    if not api_key:
-        logger.warning("SCRAPINGBEE_API_KEY is not set; skipping ScrapingBee fetch for %s", url)
-        return None
+SCRAPINGBEE_API_KEY = os.getenv("SCRAPINGBEE_API_KEY")
 
-    params = {"api_key": api_key, "url": url}
-    if render_js:
-        params["render_js"] = "true"
 
-    try:
-        resp = requests.get("https://app.scrapingbee.com/api/v1", params=params, timeout=60)
-        resp.raise_for_status()
-        return resp.text
-    except Exception as exc:
-        logger.error("ScrapingBee request failed for %s: %s", url, exc)
-        return None
+def fetch_html_with_scrapingbee(url: str) -> str:
+    if not SCRAPINGBEE_API_KEY:
+        raise RuntimeError("SCRAPINGBEE_API_KEY is not set")
+
+    api_endpoint = "https://app.scrapingbee.com/api/v1"
+    params = {
+        "api_key": SCRAPINGBEE_API_KEY,
+        "url": url,
+        # "render_js": "true",
+    }
+
+    resp = requests.get(api_endpoint, params=params, timeout=30)
+    resp.raise_for_status()
+    return resp.text
 
 
 def load_system_prompt() -> str:  # <<< ADDED
@@ -121,7 +121,14 @@ def extract_text_from_pdf_bytes(data: bytes) -> str:  # <<< ADDED
 def _fetch_url_content(url: str) -> Tuple[Optional[str], str, bytes]:  # <<< ADDED
     """Возвращает текст, content-type и байты ответа или (None, "", b"")."""  # <<< ADDED
     try:  # <<< ADDED
-        scraped_html = fetch_html_with_scrapingbee(url)
+        scraped_html: Optional[str] = None
+        try:
+            scraped_html = fetch_html_with_scrapingbee(url)
+        except RuntimeError:
+            logger.debug("SCRAPINGBEE_API_KEY is not set; skipping ScrapingBee fetch")
+        except Exception as exc:
+            logger.warning("ScrapingBee request failed for %s: %s", url, exc)
+
         if scraped_html:
             return scraped_html, "text/html", scraped_html.encode("utf-8", errors="ignore")
 
@@ -216,6 +223,19 @@ def _playwright_render(url: str) -> str:  # <<< ADDED
             logger.debug("Failed to close Playwright browser", exc_info=True)  # <<< ADDED
 
 
+def fetch_job_page_html(url: str) -> str:
+    if "tochka.com" in url:
+        logger.info("ScrapingBee: fetching %s", url)
+        try:
+            return fetch_html_with_scrapingbee(url)
+        except Exception as exc:
+            logger.error("ScrapingBee failed for %s: %s", url, exc)
+            return ""
+
+    logger.info("Playwright: fetching %s", url)
+    return _playwright_render(url)
+
+
 def extract_text_from_url(url: str) -> str:  # <<< ADDED
     """Скачиваем страницу/файл по ссылке и вытаскиваем текст."""  # <<< ADDED
     html, content_type, content = _fetch_url_content(url)  # <<< ADDED
@@ -232,15 +252,16 @@ def extract_text_from_url(url: str) -> str:  # <<< ADDED
     if primary_text:  # <<< ADDED
         candidates.append(primary_text)  # <<< ADDED
 
-    # Tochka защищается от простых запросов, поэтому сначала пробуем Playwright.  # <<< ADDED
+    # Tochka защищается от простых запросов, поэтому сначала пробуем ScrapingBee.  # <<< ADDED
     if host == "tochka.com":  # <<< ADDED
-        playwright_html = _playwright_render(url)  # <<< ADDED
-        if playwright_html:  # <<< ADDED
-            playwright_text = _html_to_text(playwright_html)  # <<< ADDED
-            if playwright_text:  # <<< ADDED
-                candidates.insert(0, playwright_text)  # <<< ADDED
+        tochka_html = fetch_job_page_html(url)
+        if tochka_html:
+            soup = BeautifulSoup(tochka_html, "html.parser")
+            tochka_text = clean_text(soup.get_text("\n"))
+            if tochka_text:
+                candidates.insert(0, tochka_text)
         else:  # <<< ADDED
-            logger.warning("Playwright returned empty HTML for %s", url)  # <<< ADDED
+            logger.warning("ScrapingBee returned empty HTML for %s", url)  # <<< ADDED
 
         if not candidates or not _is_meaningful(candidates[0]):  # <<< ADDED
             jina_text = _jina_reader(url)  # <<< ADDED
