@@ -1,4 +1,3 @@
-# parsing.py
 import logging
 import re
 from io import BytesIO
@@ -15,15 +14,16 @@ logger = logging.getLogger(__name__)
 # ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ТЕКСТА
 # =========================
 
+
 def clean_text(raw: str) -> str:
     """Очистка текста: убираем лишние пробелы и пустые строки."""
     if not raw:
         return ""
 
-    text = raw.replace('\r\n', '\n').replace('\r', '\n')
-    lines = [line.strip() for line in text.split('\n')]
-    text = '\n'.join(lines)
-    text = re.sub(r'\n{3,}', '\n\n', text)
+    text = raw.replace("\r\n", "\n").replace("\r", "\n")
+    lines = [line.strip() for line in text.split("\n")]
+    text = "\n".join(lines)
+    text = re.sub(r"\n{3,}", "\n\n", text)
 
     return text.strip()
 
@@ -31,6 +31,7 @@ def clean_text(raw: str) -> str:
 # =========================
 # PDF ПАРСЕР
 # =========================
+
 
 def extract_text_from_pdf_bytes(data: bytes) -> str:
     """
@@ -54,9 +55,17 @@ def extract_text_from_pdf_bytes(data: bytes) -> str:
         logger.info(f"✅ Извлечено {len(text)} символов из PDF")
         return text
 
+    except ValueError:
+        # Уже «человеческая» ошибка, просто прокидываем выше
+        raise
+
     except Exception as e:
-        logger.error(f"❌ Ошибка чтения PDF: {str(e)}", exc_info=True)
-        raise ValueError(f"Не удалось прочитать PDF файл: {str(e)}")
+        # В лог пишем подробности, пользователю — аккуратное сообщение
+        logger.error(f"❌ Ошибка чтения PDF: {e}", exc_info=True)
+        raise ValueError(
+            "Не удалось прочитать PDF файл. "
+            "Убедитесь, что файл не повреждён и содержит текст, а не только изображения."
+        )
 
 
 # =========================
@@ -64,8 +73,8 @@ def extract_text_from_pdf_bytes(data: bytes) -> str:
 # =========================
 
 URL_REGEX = re.compile(
-    r'^(https?://)?([a-z0-9.-]+\.[a-z]{2,})(/.*)?$',
-    re.IGNORECASE
+    r"^(https?://)?([a-z0-9.-]+\.[a-z]{2,})(/.*)?$",
+    re.IGNORECASE,
 )
 
 
@@ -98,17 +107,17 @@ def normalize_url(text: str) -> str:
 def html_to_text(html: str) -> str:
     """Извлечение текста из HTML."""
     try:
-        soup = BeautifulSoup(html, 'html.parser')
+        soup = BeautifulSoup(html, "html.parser")
 
         # Удаляем ненужные элементы
         for element in soup(["script", "style", "nav", "footer", "header"]):
             element.decompose()
 
-        text = soup.get_text(separator='\n')
+        text = soup.get_text(separator="\n")
         return clean_text(text)
 
     except Exception as e:
-        logger.error(f"❌ Ошибка извлечения текста из HTML: {str(e)}", exc_info=True)
+        logger.error(f"❌ Ошибка извлечения текста из HTML: {e}", exc_info=True)
         return ""
 
 
@@ -126,22 +135,65 @@ HEADERS = {
 }
 
 
+def _normalize_proxy_url(raw: str) -> str:
+    """
+    Приводит PROXY_URL к виду, который понимает requests.
+    Поддерживает форматы:
+    - http://user:pass@host:port
+    - socks5://user:pass@host:port
+    - host:port@user:pass      (как даёт proxy.market)
+    - user:pass@host:port
+    - host:port
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        return raw
+
+    # Уже есть схема (http://, https://, socks5:// и т.п.)
+    if re.match(r"^[a-zA-Z0-9+.-]+://", raw):
+        return raw
+
+    # Если есть логин/пароль и хост, но в произвольном порядке
+    if "@" in raw:
+        left, right = raw.split("@", 1)
+
+        def looks_like_host_port(part: str) -> bool:
+            # Примитивная эвристика: в хосте обычно есть точка и буквы
+            host, _, _ = part.partition(":")
+            return "." in host and re.search(r"[a-zA-Z]", host) is not None
+
+        if looks_like_host_port(left):
+            host_port = left
+            creds = right
+        else:
+            creds = left
+            host_port = right
+
+        return f"http://{creds}@{host_port}"
+
+    # Просто host:port — без авторизации
+    return f"http://{raw}"
+
+
 def fetch_html_via_proxy(url: str) -> str:
     """
-    Запрос HTML через RU-прокси (например, Bright Data).
-    PROXY_URL задаётся в переменной окружения, например:
-    PROXY_URL=http://user:pass@brd.superproxy.io:33335
+    Запрос HTML через RU-прокси.
+    PROXY_URL может быть:
+    - http://user:pass@host:port
+    - host:port@user:pass (как у proxy.market)
+    - и др. варианты, описанные в _normalize_proxy_url.
     """
     if not PROXY_URL:
         raise ValueError(
-            "❌ PROXY_URL не задан.\n"
+            "PROXY_URL не задан. "
             "Задайте переменную окружения PROXY_URL с адресом прокси, "
-            "например: http://user:pass@host:port"
+            "например: pool.proxy.market:10000@login:password"
         )
 
+    proxy_url = _normalize_proxy_url(PROXY_URL)
     proxies = {
-        "http": PROXY_URL,
-        "https": PROXY_URL,
+        "http": proxy_url,
+        "https": proxy_url,
     }
 
     try:
@@ -155,16 +207,15 @@ def fetch_html_via_proxy(url: str) -> str:
         )
 
         logger.info(f"Прокси ответил со статусом: {resp.status_code}")
-
         resp.raise_for_status()
+
         html = resp.text
 
         # Простейшая проверка на капчу/блокировку
         lower = html.lower()
         if any(m in lower for m in ["captcha", "access denied", "are you human"]):
             logger.warning("⚠️ Похоже на страницу с капчей/блокировкой")
-            # не обязательно сразу падать, но для начала можно так:
-            raise ValueError("Сайт вернул капчу/блокировку")
+            raise ValueError("Сайт вернул капчу или страницу с блокировкой.")
 
         if len(html) < 500:
             logger.warning(f"⚠️ Очень короткий ответ ({len(html)} символов)")
@@ -172,13 +223,36 @@ def fetch_html_via_proxy(url: str) -> str:
 
         return html
 
+    except ValueError:
+        # Уже пользовательская ошибка, просто пробрасываем
+        raise
+
     except requests.exceptions.Timeout:
         logger.error(f"❌ Таймаут при запросе {url}", exc_info=True)
-        raise TimeoutError("Сайт не отвечает. Попробуйте позже.")
+        raise ValueError("Сайт не отвечает. Попробуйте позже.")
+
+    except requests.exceptions.ProxyError as e:
+        # Здесь как раз будут ошибки вида 407 Proxy Authentication Required
+        logger.error(f"❌ Ошибка подключения к прокси: {e}", exc_info=True)
+        raise ValueError(
+            "Не удалось подключиться к прокси-серверу. "
+            "Попробуйте позже или отправьте текст вакансии вручную."
+        )
+
+    except requests.RequestException as e:
+        # Любые прочие сетевые/HTTP-ошибки
+        logger.error(f"❌ HTTP/сетевой сбой при запросе {url}: {e}", exc_info=True)
+        raise ValueError(
+            "Сайт вернул ошибку при обработке запроса. "
+            "Попробуйте ещё раз или скопируйте текст вакансии вручную."
+        )
 
     except Exception as e:
-        logger.error(f"❌ Ошибка при запросе {url}: {str(e)}", exc_info=True)
-        raise ValueError(f"Ошибка при обработке ссылки: {str(e)}")
+        logger.error(f"❌ Непредвиденная ошибка при запросе {url}: {e}", exc_info=True)
+        raise ValueError(
+            "Произошла техническая ошибка при обращении к сайту. "
+            "Попробуйте ещё раз или скопируйте текст вакансии вручную."
+        )
 
 
 def fetch_url_text_via_proxy(url: str) -> str:
@@ -197,4 +271,3 @@ def fetch_url_text_via_proxy(url: str) -> str:
 
     logger.info(f"✅ Ссылка обработана, получено {len(text)} символов текста")
     return text
-
