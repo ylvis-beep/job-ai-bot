@@ -10,6 +10,13 @@ from config import PROXY_URL, MIN_MEANINGFUL_TEXT_LENGTH
 
 logger = logging.getLogger(__name__)
 
+# Единое "человеческое" сообщение пользователю,
+# когда не удалось получить вакансию по ссылке
+GENERIC_VACANCY_ERROR_MSG = (
+    "Не удалось автоматически получить текст вакансии с сайта.\n"
+    "Пожалуйста, скопируйте и отправьте текст вакансии вручную."
+)
+
 # =========================
 # ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ТЕКСТА
 # =========================
@@ -215,11 +222,12 @@ def fetch_html_via_proxy(url: str) -> str:
         lower = html.lower()
         if any(m in lower for m in ["captcha", "access denied", "are you human"]):
             logger.warning("⚠️ Похоже на страницу с капчей/блокировкой")
-            raise ValueError("Сайт вернул капчу или страницу с блокировкой.")
+            # пользователю говорим просто «не удалось получить текст вакансии»
+            raise ValueError(GENERIC_VACANCY_ERROR_MSG)
 
         if len(html) < 500:
             logger.warning(f"⚠️ Очень короткий ответ ({len(html)} символов)")
-            raise ValueError("Не удалось получить достаточный контент с сайта.")
+            raise ValueError(GENERIC_VACANCY_ERROR_MSG)
 
         return html
 
@@ -229,30 +237,21 @@ def fetch_html_via_proxy(url: str) -> str:
 
     except requests.exceptions.Timeout:
         logger.error(f"❌ Таймаут при запросе {url}", exc_info=True)
-        raise ValueError("Сайт не отвечает. Попробуйте позже.")
+        raise ValueError(GENERIC_VACANCY_ERROR_MSG)
 
     except requests.exceptions.ProxyError as e:
         # Здесь как раз будут ошибки вида 407 Proxy Authentication Required
         logger.error(f"❌ Ошибка подключения к прокси: {e}", exc_info=True)
-        raise ValueError(
-            "Не удалось подключиться к прокси-серверу. "
-            "Попробуйте позже или отправьте текст вакансии вручную."
-        )
+        raise ValueError(GENERIC_VACANCY_ERROR_MSG)
 
     except requests.RequestException as e:
         # Любые прочие сетевые/HTTP-ошибки
         logger.error(f"❌ HTTP/сетевой сбой при запросе {url}: {e}", exc_info=True)
-        raise ValueError(
-            "Сайт вернул ошибку при обработке запроса. "
-            "Попробуйте ещё раз или скопируйте текст вакансии вручную."
-        )
+        raise ValueError(GENERIC_VACANCY_ERROR_MSG)
 
     except Exception as e:
         logger.error(f"❌ Непредвиденная ошибка при запросе {url}: {e}", exc_info=True)
-        raise ValueError(
-            "Произошла техническая ошибка при обращении к сайту. "
-            "Попробуйте ещё раз или скопируйте текст вакансии вручную."
-        )
+        raise ValueError(GENERIC_VACANCY_ERROR_MSG)
 
 
 def fetch_url_text_via_proxy(url: str) -> str:
@@ -264,10 +263,10 @@ def fetch_url_text_via_proxy(url: str) -> str:
     text = html_to_text(html)
 
     if not text or len(text) < MIN_MEANINGFUL_TEXT_LENGTH:
-        raise ValueError(
-            "Не удалось получить текст с сайта.\n"
-            "Попробуйте скопировать текст вакансии вручную."
+        logger.warning(
+            f"⚠️ Недостаточный объём текста после парсинга ({len(text)} символов)"
         )
+        raise ValueError(GENERIC_VACANCY_ERROR_MSG)
 
     logger.info(f"✅ Ссылка обработана, получено {len(text)} символов текста")
     return text
