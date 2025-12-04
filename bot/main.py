@@ -1,559 +1,502 @@
 import os
 import logging
-from typing import Any, Dict, List, Optional, Tuple, cast  # <<< ADDED
-import re  # <<< ADDED
-from urllib.parse import urlparse  # <<< ADDED
-import requests  # <<< ADDED
-from bs4 import BeautifulSoup  # <<< ADDED
-from io import BytesIO  # <<< ADDED
-from PyPDF2 import PdfReader  # <<< ADDED
+import re
+import time
+from typing import Any, Dict, List, Optional, cast
+from urllib.parse import urlparse
+from io import BytesIO
 
+import requests
+from bs4 import BeautifulSoup
+from PyPDF2 import PdfReader
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from openai import OpenAI
-from openai.types.chat import ChatCompletionMessageParam  # <<< ADDED
+from openai.types.chat import ChatCompletionMessageParam
 
-# Enable logging
+# Настройка логирования
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO)
+    level=logging.INFO
+)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
-# Initialize OpenAI client
-# the newest OpenAI model is "gpt-4.1-mini" which was released June 2024.  # <<< CHANGED
-# do not change this unless explicitly requested by the user
+# Инициализация клиентов
 openai_client = None
 
-DEFAULT_HEADERS = {  # <<< ADDED
-    "User-Agent": (  # <<< ADDED
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "  # <<< ADDED
-        "AppleWebKit/537.36 (KHTML, like Gecko) "  # <<< ADDED
-        "Chrome/125.0.0.0 Safari/537.36"  # <<< ADDED
-    ),  # <<< ADDED
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",  # <<< ADDED
-    "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",  # <<< ADDED
-    "Cache-Control": "no-cache",  # <<< ADDED
-    "Pragma": "no-cache",  # <<< ADDED
-    "Upgrade-Insecure-Requests": "1",  # <<< ADDED
-    "Sec-Ch-Ua": '"Chromium";v="125", "Not.A/Brand";v="24", "Google Chrome";v="125"',  # <<< ADDED
-    "Sec-Ch-Ua-Mobile": "?0",  # <<< ADDED
-    "Sec-Ch-Ua-Platform": '"macOS"',  # <<< ADDED
-}  # <<< ADDED
+# Константы
+MIN_MEANINGFUL_TEXT_LENGTH = 400
 
-MIN_MEANINGFUL_TEXT_LENGTH = 400  # <<< ADDED
-
+# =========================
+# SCRAPINGBEE API - ТОЛЬКО ДЛЯ ССЫЛОК
+# =========================
 
 SCRAPINGBEE_API_KEY = os.getenv("SCRAPINGBEE_API_KEY")
 
-
-def fetch_html_with_scrapingbee(url: str) -> str:
+def parse_url_with_scrapingbee(url: str) -> str:
+    """
+    Парсинг веб-страниц через ScrapingBee API
+    РАБОТАЕТ ТОЛЬКО ДЛЯ ССЫЛОК!
+    """
     if not SCRAPINGBEE_API_KEY:
-        raise RuntimeError("SCRAPINGBEE_API_KEY is not set")
-
+        raise ValueError(
+            "❌ SCRAPINGBEE_API_KEY не установлен!\n"
+            "Получите бесплатный ключ: https://www.scrapingbee.com/\n"
+            "Добавьте в .env файл: SCRAPINGBEE_API_KEY=ваш_ключ"
+        )
+    
     api_endpoint = "https://app.scrapingbee.com/api/v1"
+    
+    # Правильные параметры для обхода блокировок
     params = {
         "api_key": SCRAPINGBEE_API_KEY,
         "url": url,
-        # "render_js": "true",
+        "render_js": "true",           # Обязательно для современных сайтов
+        "premium_proxy": "true",       # Используем резидентские прокси
+        "country_code": "ru",          # Российские IP
+        "wait": "3000",                # Ждем 3 секунды для загрузки JS
+        "block_resources": "false",    # Не блокируем ресурсы
+        "timeout": "30000",            # Таймаут 30 секунд
     }
-
-    resp = requests.get(api_endpoint, params=params, timeout=30)
-    resp.raise_for_status()
-    return resp.text
-
-
-def load_system_prompt() -> str:  # <<< ADDED
-    """Load the system prompt from system_prompt.txt if it exists."""  # <<< ADDED
-    try:  # <<< ADDED
-        base_dir = os.path.dirname(os.path.abspath(__file__))  # <<< ADDED
-        file_path = os.path.join(base_dir, "system_prompt.txt")  # <<< ADDED
-        with open(file_path, "r", encoding="utf-8") as f:  # <<< ADDED
-            return f.read()  # <<< ADDED
-    except FileNotFoundError:  # <<< ADDED
-        return "You are a helpful assistant."  # <<< ADDED
-    except Exception as e:  # <<< ADDED
-        logger.warning(f"Failed to load system_prompt.txt: {e}")  # <<< ADDED
-        return "You are a helpful assistant."  # <<< ADDED
-
-
-# =========================
-# Парсинг текста / ссылок / PDF  # <<< ADDED
-# =========================
-
-def clean_text(raw: str) -> str:  # <<< ADDED
-    """Приводит текст в аккуратный вид."""  # <<< ADDED
-    if not raw:  # <<< ADDED
-        return ""  # <<< ADDED
-    text = raw.replace("\r\n", "\n")  # <<< ADDED
-    lines = [line.strip() for line in text.split("\n")]  # <<< ADDED
-    text = "\n".join(lines)  # <<< ADDED
-    text = re.sub(r"\n{3,}", "\n\n", text)  # <<< ADDED
-    return text.strip()  # <<< ADDED
-
-
-def is_url(text: str) -> bool:  # <<< ADDED
-    """Проверяем, похожа ли строка на URL."""  # <<< ADDED
-    if not text:  # <<< ADDED
-        return False  # <<< ADDED
-    text = text.strip()  # <<< ADDED
-    try:  # <<< ADDED
-        parsed = urlparse(text)  # <<< ADDED
-        return parsed.scheme in ("http", "https") and bool(parsed.netloc)  # <<< ADDED
-    except ValueError:  # <<< ADDED
-        return False  # <<< ADDED
-
-
-def extract_text_from_pdf_bytes(data: bytes) -> str:  # <<< ADDED
-    """Достаём текст из PDF по сырым байтам."""  # <<< ADDED
-    try:  # <<< ADDED
-        reader = PdfReader(BytesIO(data))  # <<< ADDED
-        pages_text: List[str] = []  # <<< ADDED
-        for page in reader.pages:  # <<< ADDED
-            page_text = page.extract_text() or ""  # <<< ADDED
-            pages_text.append(page_text)  # <<< ADDED
-        return clean_text("\n\n".join(pages_text))  # <<< ADDED
-    except Exception as e:  # <<< ADDED
-        logger.error(f"Error while extracting text from PDF bytes: {e}")  # <<< ADDED
-        return ""  # <<< ADDED
-
-
-def _fetch_url_content(url: str) -> Tuple[Optional[str], str, bytes]:  # <<< ADDED
-    """Возвращает текст, content-type и байты ответа или (None, "", b"")."""  # <<< ADDED
-    try:  # <<< ADDED
-        scraped_html: Optional[str] = None
-        try:
-            scraped_html = fetch_html_with_scrapingbee(url)
-        except RuntimeError:
-            logger.debug("SCRAPINGBEE_API_KEY is not set; skipping ScrapingBee fetch")
-        except Exception as exc:
-            logger.warning("ScrapingBee request failed for %s: %s", url, exc)
-
-        if scraped_html:
-            return scraped_html, "text/html", scraped_html.encode("utf-8", errors="ignore")
-
-        resp = requests.get(url, headers=DEFAULT_HEADERS, timeout=20)  # <<< ADDED
-        resp.raise_for_status()  # <<< ADDED
-        return resp.text, resp.headers.get("Content-Type", ""), resp.content  # <<< ADDED
-    except Exception as exc:  # <<< ADDED
-        logger.warning(f"Failed to fetch {url}: {exc}")  # <<< ADDED
-        return None, "", b""  # <<< ADDED
-
-
-def _html_to_text(html: str) -> str:  # <<< ADDED
-    soup = BeautifulSoup(html, "html.parser")  # <<< ADDED
-    body = soup.body or soup  # <<< ADDED
-    text = body.get_text(separator="\n")  # <<< ADDED
-    return clean_text(text)  # <<< ADDED
-
-
-def _is_meaningful(text: str) -> bool:  # <<< ADDED
-    return len(text) >= MIN_MEANINGFUL_TEXT_LENGTH  # <<< ADDED
-
-
-def _jina_reader(url: str) -> str:  # <<< ADDED
-    jina_url = f"https://r.jina.ai/{url}"  # <<< ADDED
-    html, content_type, content = _fetch_url_content(jina_url)  # <<< ADDED
-    if not html:  # <<< ADDED
-        return ""  # <<< ADDED
-    if "pdf" in content_type.lower():  # <<< ADDED
-        return extract_text_from_pdf_bytes(content)  # <<< ADDED
-    return clean_text(html)  # <<< ADDED
-
-
-def _looks_like_captcha(html: str) -> bool:  # <<< ADDED
-    """Грубая эвристика: похоже ли содержимое на капчу/блокировку."""  # <<< ADDED
-    if not html:  # <<< ADDED
-        return False  # <<< ADDED
-    lowered = html.lower()  # <<< ADDED
-    captcha_markers = [  # <<< ADDED
-        "captcha",  # <<< ADDED
-        "cloudflare",  # <<< ADDED
-        "attention required",  # <<< ADDED
-        "are you human",  # <<< ADDED
-        "access denied",  # <<< ADDED
-    ]  # <<< ADDED
-    return any(marker in lowered for marker in captcha_markers)  # <<< ADDED
-
-
-def _playwright_render(url: str) -> str:  # <<< ADDED
-    """Рендер страницы как реальным браузером, чтобы получить JS-контент."""  # <<< ADDED
-    try:  # <<< ADDED
-        from playwright.sync_api import sync_playwright  # type: ignore  # <<< ADDED
-    except Exception as exc:  # <<< ADDED
-        logger.error("Playwright is unavailable: %s", exc)  # <<< ADDED
-        return ""  # <<< ADDED
-
-    browser = None  # <<< ADDED
-    context = None  # <<< ADDED
-    try:  # <<< ADDED
-        with sync_playwright() as p:  # <<< ADDED
-            browser = p.chromium.launch(  # <<< ADDED
-                headless=True,  # <<< ADDED
-                args=["--disable-blink-features=AutomationControlled"],  # <<< ADDED
-            )  # <<< ADDED
-            context = browser.new_context(  # <<< ADDED
-                user_agent=DEFAULT_HEADERS["User-Agent"],  # <<< ADDED
-                viewport={"width": 1365, "height": 768},  # <<< ADDED
-                locale="ru-RU",  # <<< ADDED
-                java_script_enabled=True,  # <<< ADDED
-                extra_http_headers=DEFAULT_HEADERS,  # <<< ADDED
-            )  # <<< ADDED
-            page = context.new_page()  # <<< ADDED
-            page.goto(url, wait_until="networkidle", timeout=40000)  # <<< ADDED
-            page.wait_for_timeout(3000)  # подождём JS  # <<< ADDED
-            html = page.content()  # <<< ADDED
-            if _looks_like_captcha(html):  # <<< ADDED
-                logger.warning("Captcha or block page detected when rendering %s", url)  # <<< ADDED
-            logger.info("Playwright rendered %s (len=%s)", url, len(html))  # <<< ADDED
-            return html  # <<< ADDED
-    except Exception as exc:  # <<< ADDED
-        logger.error("Playwright failed for %s: %s", url, exc, exc_info=True)  # <<< ADDED
-        return ""  # <<< ADDED
-    finally:  # <<< ADDED
-        try:  # <<< ADDED
-            if context is not None:  # <<< ADDED
-                context.close()  # <<< ADDED
-        except Exception:  # <<< ADDED
-            logger.debug("Failed to close Playwright context", exc_info=True)  # <<< ADDED
-        try:  # <<< ADDED
-            if browser is not None:  # <<< ADDED
-                browser.close()  # <<< ADDED
-        except Exception:  # <<< ADDED
-            logger.debug("Failed to close Playwright browser", exc_info=True)  # <<< ADDED
-
-
-def fetch_job_page_html(url: str) -> str:
-    if "tochka.com" in url:
-        logger.info("ScrapingBee: fetching %s", url)
-        try:
-            return fetch_html_with_scrapingbee(url)
-        except Exception as exc:
-            logger.error("ScrapingBee failed for %s: %s", url, exc)
+    
+    try:
+        logger.info(f"🔗 Парсим ссылку через ScrapingBee: {url}")
+        
+        response = requests.get(
+            api_endpoint,
+            params=params,
+            timeout=35,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            }
+        )
+        
+        if response.status_code == 200:
+            html = response.text
+            
+            # Проверяем, не вернулась ли капча/блокировка
+            html_lower = html.lower()
+            if any(marker in html_lower for marker in ["captcha", "cloudflare", "access denied"]):
+                logger.error("⚠️ Сайт вернул капчу/блокировку")
+                raise ValueError("Сайт заблокировал запрос. Попробуйте скопировать текст вручную.")
+            
+            if len(html) < 500:
+                logger.warning(f"⚠️ ScrapingBee вернул короткий ответ ({len(html)} символов)")
+                raise ValueError("Не удалось получить контент с сайта.")
+            
+            logger.info(f"✅ Успешно получено {len(html)} символов с {url}")
+            return html
+            
+        elif response.status_code == 403:
+            logger.error("❌ Доступ запрещен (проверьте API ключ)")
+            raise PermissionError("Неверный API ключ ScrapingBee")
+            
+        elif response.status_code == 429:
+            logger.error("❌ Превышен лимит запросов")
+            raise RuntimeError("Лимит ScrapingBee исчерпан. Подождите или обновите тариф.")
+            
+        else:
+            logger.error(f"❌ Ошибка ScrapingBee: {response.status_code}")
+            response.raise_for_status()
             return ""
+            
+    except requests.exceptions.Timeout:
+        logger.error(f"❌ Таймаут при парсинге {url}")
+        raise TimeoutError("Сайт не отвечает. Попробуйте позже.")
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка парсинга {url}: {str(e)}")
+        raise ValueError(f"Ошибка при обработке ссылки: {str(e)}")
 
-    logger.info("Playwright: fetching %s", url)
-    return _playwright_render(url)
+# =========================
+# PDF ПАРСЕР - ТОЛЬКО ДЛЯ PDF
+# =========================
 
-
-def extract_text_from_url(url: str) -> str:  # <<< ADDED
-    """Скачиваем страницу/файл по ссылке и вытаскиваем текст."""  # <<< ADDED
-    html, content_type, content = _fetch_url_content(url)  # <<< ADDED
-    parsed = urlparse(url)  # <<< ADDED
-    host = parsed.netloc.lower()  # <<< ADDED
-    if host.startswith("www."):  # <<< ADDED
-        host = host[4:]  # <<< ADDED
-
-    if "pdf" in content_type.lower():  # <<< ADDED
-        return extract_text_from_pdf_bytes(content)  # <<< ADDED
-
-    primary_text = _html_to_text(html) if html else ""  # <<< ADDED
-    candidates: List[str] = []  # <<< ADDED
-    if primary_text:  # <<< ADDED
-        candidates.append(primary_text)  # <<< ADDED
-
-    # Tochka защищается от простых запросов, поэтому сначала пробуем ScrapingBee.  # <<< ADDED
-    if host == "tochka.com":  # <<< ADDED
-        tochka_html = fetch_job_page_html(url)
-        if tochka_html:
-            soup = BeautifulSoup(tochka_html, "html.parser")
-            tochka_text = clean_text(soup.get_text("\n"))
-            if tochka_text:
-                candidates.insert(0, tochka_text)
-        else:  # <<< ADDED
-            logger.warning("ScrapingBee returned empty HTML for %s", url)  # <<< ADDED
-
-        if not candidates or not _is_meaningful(candidates[0]):  # <<< ADDED
-            jina_text = _jina_reader(url)  # <<< ADDED
-            if jina_text:  # <<< ADDED
-                logger.info(
-                    "Using Jina Reader fallback for tochka.com (len=%s)", len(jina_text)
-                )  # <<< ADDED
-                candidates.insert(0, jina_text)  # <<< ADDED
-    elif not _is_meaningful(primary_text):  # <<< ADDED
-        jina_text = _jina_reader(url)  # <<< ADDED
-        if jina_text:  # <<< ADDED
-            logger.info(
-                "Primary fetch too short (len=%s), using Jina Reader", len(primary_text)
-            )  # <<< ADDED
-            candidates.append(jina_text)  # <<< ADDED
-
-    for text in candidates:  # <<< ADDED
-        if _is_meaningful(text):  # <<< ADDED
-            return text  # <<< ADDED
-
-    return candidates[0] if candidates else ""  # <<< ADDED
-
-
-def prepare_input_text(raw: str) -> str:  # <<< ADDED
+def extract_text_from_pdf_bytes(data: bytes) -> str:
     """
-    Универсальная функция:
-    - если ссылка — скачиваем и чистим,
-    - если текст — просто чистим.
-    """  # <<< ADDED
-    if not raw:  # <<< ADDED
-        return ""  # <<< ADDED
-    raw = raw.strip()  # <<< ADDED
-    if is_url(raw):  # <<< ADDED
-        return extract_text_from_url(raw)  # <<< ADDED
-    return clean_text(raw)  # <<< ADDED
+    Извлечение текста из PDF файла
+    РАБОТАЕТ ТОЛЬКО ДЛЯ PDF!
+    """
+    try:
+        reader = PdfReader(BytesIO(data))
+        pages_text = []
+        
+        for page in reader.pages:
+            page_text = page.extract_text()
+            if page_text:
+                pages_text.append(page_text)
+        
+        text = "\n\n".join(pages_text)
+        
+        # Очистка текста
+        text = clean_text(text)
+        
+        if not text or len(text) < 50:
+            raise ValueError("PDF файл пуст или не содержит читаемого текста")
+        
+        logger.info(f"✅ Извлечено {len(text)} символов из PDF")
+        return text
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка чтения PDF: {str(e)}")
+        raise ValueError(f"Не удалось прочитать PDF файл: {str(e)}")
 
+# =========================
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# =========================
+
+def clean_text(raw: str) -> str:
+    """Очистка текста"""
+    if not raw:
+        return ""
+    
+    text = raw.replace('\r\n', '\n').replace('\r', '\n')
+    lines = [line.strip() for line in text.split('\n')]
+    text = '\n'.join(lines)
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    
+    return text.strip()
+
+def is_url(text: str) -> bool:
+    """Проверка, является ли текст URL"""
+    if not text:
+        return False
+    
+    text = text.strip()
+    try:
+        parsed = urlparse(text)
+        return parsed.scheme in ('http', 'https') and bool(parsed.netloc)
+    except:
+        return False
+
+def html_to_text(html: str) -> str:
+    """Извлечение текста из HTML"""
+    try:
+        soup = BeautifulSoup(html, 'html.parser')
+        
+        # Удаляем ненужные элементы
+        for element in soup(["script", "style", "nav", "footer", "header"]):
+            element.decompose()
+        
+        text = soup.get_text(separator='\n')
+        return clean_text(text)
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка извлечения текста из HTML: {str(e)}")
+        return ""
+
+def load_system_prompt() -> str:
+    """Загрузка системного промпта"""
+    try:
+        with open("system_prompt.txt", "r", encoding="utf-8") as f:
+            return f.read()
+    except FileNotFoundError:
+        # Промпт для анализа резюме и вакансий
+        return """Ты помощник для составления сопроводительных писем к резюме. 
+Пользователь отправляет тебе:
+1. Сначала свое резюме (текст или PDF)
+2. Потом вакансию (ссылку или текст)
+
+Твоя задача:
+1. Проанализировать соответствие резюме вакансии
+2. Выделить ключевые совпадения навыков
+3. Составить сопроводительное письмо
+4. Дать рекомендации по улучшению резюме
+
+Будь конкретным, деловым и полезным."""
+
+# =========================
+# TELEGRAM BOT ФУНКЦИИ
+# =========================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Send a message when the command /start is issued."""
-    message = update.message  # <<< ADDED
-    if message is None:  # <<< ADDED
-        logger.warning("Received /start update without message")  # <<< ADDED
-        return  # <<< ADDED
-
-    user = update.effective_user  # <<< ADDED
-    if user is None:  # <<< ADDED
-        await message.reply_text(  # <<< ADDED
-            "Привет! Я твой помощник в поиске работы и по сопроводительным письмам. "
-            "Отправь резюме или ссылку на него, а я подберу формулировки и соберу письма под нужные вакансии"
-        )
-        return  # <<< ADDED
-
-    await message.reply_html(  # <<< CHANGED
-        f"Привет {user.mention_html()}! Я твой помощник в поиске работы и по сопроводительным письмам. "
-        f"Отправь резюме или ссылку на него, а я подберу формулировки и соберу письма под нужные вакансии"
+    """Команда /start"""
+    user = update.effective_user
+    await update.message.reply_html(
+        f"👋 Привет {user.mention_html()}!\n\n"
+        f"Я помогу составить идеальное сопроводительное письмо.\n\n"
+        f"📝 <b>Как это работает:</b>\n"
+        f"1. Отправь мне свое <b>резюме</b> (текст или PDF)\n"
+        f"2. Потом отправь <b>вакансию</b> (ссылку или текст)\n"
+        f"3. Я проанализирую и составлю письмо\n\n"
+        f"🔗 <b>Поддерживаю:</b> hh.ru, tochka.com, habr.com и другие сайты\n"
+        f"📄 <b>Форматы:</b> PDF, текст, ссылки"
     )
 
-
-async def help_command(update: Update,
-                       context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Send a message when the command /help is issued."""
-    message = update.message  # <<< ADDED
-    if message is None:  # <<< ADDED
-        logger.warning("Received /help update without message")  # <<< ADDED
-        return  # <<< ADDED
-
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Команда /help"""
     help_text = """
-Available commands:
-/start - Start the bot
-/help - Show this help message.
-/update_resume - Загрузите новые файлы с описанием вашего опыта
+📋 <b>Доступные команды:</b>
+/start - Начать работу
+/help - Помощь
+/update_resume - Обновить резюме
 
-Чтобы я работал точнее, сначала пришли полное описание своих навыков, опыта и достижений или резюме.
-Потом отправляй вакансии, а я буду присылать:
+📝 <b>Как использовать:</b>
+1. Сначала отправь резюме командой /update_resume
+2. Потом отправляй вакансии
+3. Я составлю сопроводительное письмо
 
-* главные требования для резюме
-* таблицу совпадений и процент совпадения
-* пункты, которые лучше подсветить при отклике
-* готовое сопроводительное письмо
+🔗 <b>Примеры:</b>
+- Отправь PDF с резюме
+- Отправь ссылку на hh.ru/vacancy/123
+- Отправь текст вакансии
 
+💡 <b>Совет:</b> Чем подробнее резюме, тем лучше результат!
+"""
+    await update.message.reply_text(help_text, parse_mode='HTML')
+
+async def update_resume(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обновление резюме"""
+    context.user_data['awaiting_resume'] = True
+    await update.message.reply_text(
+        "📝 Отправь свое резюме одним из способов:\n\n"
+        "• PDF файл с резюме\n"
+        "• Текст резюме\n"
+        "• Ссылку на резюме\n\n"
+        "Я сохраню его для последующего анализа вакансий."
+    )
+
+async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    await message.reply_text(help_text)  # <<< CHANGED
-
-
-async def update_resume(update: Update,
-                        context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /update_resume command."""
-    message = update.message  # <<< ADDED
-    if message is None:  # <<< ADDED
-        logger.warning("Received /update_resume update without message")  # <<< ADDED
-        return  # <<< ADDED
-
-    user_data = cast(Dict[str, Any], context.user_data)  # <<< ADDED
-    user_data['awaiting_resume'] = True  # <<< CHANGED
-    user_data.pop('resume', None)  # <<< CHANGED
-    await message.reply_text("Загрузите новые файлы с описанием вашего опыта")  # <<< CHANGED
-
-
-async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle user messages with OpenAI."""
-    message = update.message  # <<< ADDED
-    if message is None:  # <<< ADDED
-        logger.warning("Received text update without message in chat handler")  # <<< ADDED
-        return  # <<< ADDED
-
-    if not openai_client:
-        await message.reply_text(
-            "Sorry, OpenAI is not configured. Please set the OPENAI_API_KEY environment variable."
-        )
+    Основная функция обработки сообщений
+    Четкая логика: PDF → локальный парсер, Ссылка → ScrapingBee, Текст → как есть
+    """
+    message = update.message
+    if not message:
         return
-
-    user_data = cast(Dict[str, Any], context.user_data)  # <<< ADDED
-
-    # Определяем, откуда брать текст: PDF или текст  # <<< ADDED
-    user_message: str  # <<< ADDED
-
-    if message.document is not None:  # <<< ADDED
-        doc = message.document  # <<< ADDED
-        is_pdf = (
-            doc.mime_type == "application/pdf"
-            or (doc.file_name and doc.file_name.lower().endswith(".pdf"))
-        )
-
-        if not is_pdf:  # <<< ADDED
-            await message.reply_text(
-                "Сейчас я умею обрабатывать только PDF-файлы и текстовые сообщения."
-            )
-            return
-
-        try:
-            file = await doc.get_file()
+    
+    user_data = context.user_data
+    
+    try:
+        # 1. ОПРЕДЕЛЯЕМ ТИП СООБЩЕНИЯ
+        text_content = ""
+        
+        if message.document and message.document.mime_type == "application/pdf":
+            # 📄 PDF ФАЙЛ - парсим локально
+            logger.info(f"📄 Обработка PDF от пользователя {message.from_user.id}")
+            
+            file = await message.document.get_file()
             bio = BytesIO()
             await file.download_to_memory(out=bio)
-            pdf_bytes = bio.getvalue()
-            extracted = extract_text_from_pdf_bytes(pdf_bytes)
-            if not extracted:
-                await message.reply_text(
-                    "Не удалось извлечь текст из PDF. Попробуйте другой файл или отправьте текст."
-                )
-                return
-            user_message = extracted
-        except Exception as e:
-            logger.error(f"Error while downloading/reading PDF: {e}")
+            
+            text_content = extract_text_from_pdf_bytes(bio.getvalue())
+            logger.info(f"✅ PDF обработан: {len(text_content)} символов")
+            
+        elif message.text:
+            input_text = message.text.strip()
+            
+            if is_url(input_text):
+                # 🔗 ССЫЛКА - парсим через ScrapingBee
+                logger.info(f"🔗 Обработка ссылки: {input_text}")
+                
+                # Показываем, что бот работает
+                await message.chat.send_action(action="typing")
+                
+                # Парсим через ScrapingBee
+                html = parse_url_with_scrapingbee(input_text)
+                
+                # Извлекаем текст из HTML
+                text_content = html_to_text(html)
+                
+                if not text_content or len(text_content) < MIN_MEANINGFUL_TEXT_LENGTH:
+                    raise ValueError(
+                        f"Не удалось получить текст с сайта.\n"
+                        f"Попробуйте скопировать текст вакансии вручную."
+                    )
+                
+                logger.info(f"✅ Ссылка обработана: {len(text_content)} символов")
+                
+            else:
+                # 📝 ОБЫЧНЫЙ ТЕКСТ - используем как есть
+                text_content = clean_text(input_text)
+                logger.info(f"📝 Обработка текста: {len(text_content)} символов")
+        
+        else:
             await message.reply_text(
-                "Произошла ошибка при чтении PDF-файла. Попробуйте ещё раз или отправьте текст."
+                "❌ Поддерживаются только:\n"
+                "• PDF файлы\n"
+                "• Текст\n"
+                "• Ссылки на сайты"
             )
             return
-
-    else:  # текстовое сообщение
-        raw_text = message.text
-        if raw_text is None:
-            await message.reply_text("Я могу обрабатывать только текст или PDF-файлы.")
-            return
-        try:
-            user_message = prepare_input_text(raw_text)
-        except Exception as e:
-            logger.error(f"Error while processing input text or URL: {e}")
+        
+        # 2. ПРОВЕРЯЕМ КОНТЕКСТ (резюме или вакансия)
+        if user_data.get('awaiting_resume'):
+            # 📋 СОХРАНЯЕМ РЕЗЮМЕ
+            user_data['resume'] = text_content
+            user_data['awaiting_resume'] = False
+            
             await message.reply_text(
-                "Не удалось обработать текст или ссылку. Попробуйте другой формат."
+                f"✅ <b>Резюме сохранено!</b>\n\n"
+                f"📊 Получено: {len(text_content)} символов\n\n"
+                f"Теперь отправь <b>вакансию</b> (ссылку или текст),\n"
+                f"и я составлю сопроводительное письмо!",
+                parse_mode='HTML'
             )
-            return
-
-    # Если ожидаем новое резюме после /update_resume — сохраняем его и не вызываем OpenAI
-    if user_data.get("awaiting_resume"):
-        user_data["resume"] = user_message
-        user_data["awaiting_resume"] = False
-        await message.reply_text(
-            "Спасибо! Я обновил информацию о вашем опыте. Теперь отправьте вакансию или вопрос, "
-            "и я буду использовать это резюме для анализа."
-        )
-        return
-
-    try:
-        # Send typing action to show the bot is processing
-        await message.chat.send_action(action="typing")
-
-        system_prompt = load_system_prompt()
-
-        # История диалога по пользователю/чату
-        history = cast(List[Dict[str, str]], user_data.get("history", []))
-        max_history_messages = 10
-
-        messages: List[ChatCompletionMessageParam] = [
-            {
-                "role": "system",
-                "content": system_prompt
-            }
-        ]
-
-        # >>> ВОТ ЗДЕСЬ БЫЛА ОШИБКА ТИПОВ <<<
-        if history:
-            messages.extend(history[-max_history_messages:])  # type: ignore[arg-type]  # <<< CHANGED
-
-        # Если сохранено резюме — добавляем его как отдельное сообщение-контекст
-        resume = user_data.get("resume")
-        if resume:
-            messages.append({
-                "role": "user",
-                "content": (
-                    "Это резюме пользователя. Используй его как основной контекст "
-                    "при анализе вакансий, составлении таблиц совпадений и подготовке сопроводительных писем:\n\n"
-                    f"{resume}"
-                ),
-            })
-
-        # Текущее сообщение
-        messages.append({
-            "role": "user",
-            "content": user_message
-        })
-
-        # Call OpenAI API
-        response = openai_client.chat.completions.create(
-            model="gpt-4.1-mini",
-            messages=messages,
-            max_completion_tokens=2048
-        )
-
-        ai_response = response.choices[0].message.content or (
-            "Извините, не удалось сформировать ответ."
-        )
-        await message.reply_text(ai_response)
-
-        # Обновляем историю: user → assistant
-        if ai_response:
-            history.append({"role": "user", "content": user_message})
-            history.append({"role": "assistant", "content": ai_response})
-            user_data["history"] = history[-max_history_messages:]
-
+            
+        elif 'resume' in user_data:
+            # 🎯 АНАЛИЗИРУЕМ ВАКАНСИЮ
+            await analyze_vacancy(message, user_data['resume'], text_content)
+            
+        else:
+            # ❓ НЕТ РЕЗЮМЕ - просим сначала его
+            await message.reply_text(
+                "📝 Сначала отправь свое <b>резюме</b> командой /update_resume,\n"
+                "а потом - вакансию для анализа.",
+                parse_mode='HTML'
+            )
+            
+    except ValueError as e:
+        # Ошибки пользовательского ввода
+        await message.reply_text(f"⚠️ {str(e)}")
+        
     except Exception as e:
-        logger.error(f"Error calling OpenAI API: {e}")
+        # Неожиданные ошибки
+        logger.error(f"❌ Критическая ошибка: {str(e)}", exc_info=True)
         await message.reply_text(
-            "Sorry, I encountered an error processing your message. Please try again."
+            "❌ Произошла непредвиденная ошибка.\n"
+            "Попробуйте еще раз или свяжитесь с поддержкой."
         )
 
+async def analyze_vacancy(message, resume_text: str, vacancy_text: str) -> None:
+    """
+    Анализ вакансии с использованием OpenAI
+    """
+    if not openai_client:
+        await message.reply_text("❌ OpenAI не настроен. Проверьте OPENAI_API_KEY")
+        return
+    
+    # Показываем, что бот работает
+    await message.chat.send_action(action="typing")
+    
+    try:
+        system_prompt = load_system_prompt()
+        
+        # Формируем промпт для анализа
+        prompt = f"""
+АНАЛИЗ СОПРОВОДИТЕЛЬНОГО ПИСЬМА
 
-async def error_handler(update: Update,
-                        context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Log errors caused by updates."""
-    logger.error(f"Update {update} caused error {context.error}")
+РЕЗЮМЕ КАНДИДАТА:
+{resume_text[:3000]}  # Ограничиваем размер
 
+ТЕКСТ ВАКАНСИИ:
+{vacancy_text[:3000]}  # Ограничиваем размер
+
+ЗАДАЧА:
+1. Проанализировать соответствие резюме требованиям вакансии
+2. Выделить 3-5 ключевых совпадений навыков и опыта
+3. Составить профессиональное сопроводительное письмо
+4. Дать рекомендации по подаче (что подчеркнуть в резюме)
+
+ФОРМАТ ОТВЕТА:
+📊 Анализ соответствия
+✅ Ключевые совпадения
+📝 Готовое сопроводительное письмо
+💡 Рекомендации по подаче
+
+Будь конкретным, деловым и полезным.
+"""
+        
+        response = openai_client.chat.completions.create(
+            model="gpt-4.1-mini",  # Идеально для этой задачи
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.7,
+            max_tokens=2000
+        )
+        
+        ai_response = response.choices[0].message.content or "❌ Не удалось сформировать ответ"
+        
+        # Отправляем ответ пользователю
+        if len(ai_response) > 4000:
+            # Разбиваем длинные сообщения
+            parts = [ai_response[i:i+4000] for i in range(0, len(ai_response), 4000)]
+            for i, part in enumerate(parts, 1):
+                await message.reply_text(f"📄 Часть {i}/{len(parts)}:\n\n{part}")
+        else:
+            await message.reply_text(ai_response)
+            
+        logger.info(f"✅ OpenAI ответ сгенерирован: {len(ai_response)} символов")
+        
+    except Exception as e:
+        logger.error(f"❌ OpenAI ошибка: {str(e)}")
+        await message.reply_text(
+            "❌ Ошибка при анализе через AI.\n"
+            "Попробуйте еще раз или проверьте подключение."
+        )
+
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработка ошибок"""
+    logger.error(f"Ошибка в боте: {context.error}", exc_info=True)
+    
+    if update and update.message:
+        await update.message.reply_text(
+            "⚠️ Произошла техническая ошибка.\n"
+            "Разработчики уже уведомлены. Попробуйте позже."
+        )
 
 def main() -> None:
-    """Start the bot."""
+    """Запуск бота"""
     global openai_client
-
-    # Get the bot token from environment variable
+    
+    # Проверка обязательных переменных
     token = os.getenv('TELEGRAM_BOT_TOKEN')
-    openai_api_key = os.getenv('OPENAI_API_KEY')
-
+    openai_key = os.getenv('OPENAI_API_KEY')
+    scrapingbee_key = os.getenv('SCRAPINGBEE_API_KEY')
+    
     if not token:
-        logger.error("TELEGRAM_BOT_TOKEN not found in environment variables!")
-        print(
-            "ERROR: Please set your TELEGRAM_BOT_TOKEN environment variable.")
-        print("You can get a token from @BotFather on Telegram.")
+        print("❌ ОШИБКА: TELEGRAM_BOT_TOKEN не найден!")
+        print("Добавьте в .env файл: TELEGRAM_BOT_TOKEN=ваш_токен")
+        print("Получите токен у @BotFather в Telegram")
         return
-
-    if not openai_api_key:
-        logger.warning("OPENAI_API_KEY not found in environment variables!")
-        print(
-            "WARNING: OpenAI API key not set. The bot will run but AI features won't work."
-        )
-        print("Please set your OPENAI_API_KEY to enable AI responses.")
-    else:
-        # Initialize OpenAI client
-        openai_client = OpenAI(api_key=openai_api_key)
-        logger.info("OpenAI client initialized successfully")
-
-    # Create the Application
-    application = Application.builder().token(token).build()
-
-    # Register command handlers
-    application.add_handler(CommandHandler("start", start))  # type: ignore[arg-type]
-    application.add_handler(CommandHandler("help", help_command))  # type: ignore[arg-type]
-    application.add_handler(CommandHandler("update_resume", update_resume))  # type: ignore[arg-type]
-
-    # Register message handler for текст + PDF
-    application.add_handler(
-        MessageHandler(
-            (filters.TEXT | filters.Document.PDF) & ~filters.COMMAND,
-            chat,  # type: ignore[arg-type]
-        )
-    )
-
-    # Register error handler
-    application.add_error_handler(error_handler)  # type: ignore[arg-type]
-
-    # Start the bot
-    logger.info("Bot is starting...")
-    print("Bot is running! Press Ctrl+C to stop.")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
-
+    
+    if not openai_key:
+        print("⚠️ ВНИМАНИЕ: OPENAI_API_KEY не найден")
+        print("AI функции не будут работать")
+        print("Добавьте в .env: OPENAI_API_KEY=ваш_ключ")
+    
+    if not scrapingbee_key:
+        print("⚠️ ВНИМАНИЕ: SCRAPINGBEE_API_KEY не найден")
+        print("Парсинг ссылок не будет работать")
+        print("Получите бесплатный ключ: https://www.scrapingbee.com/")
+        print("Добавьте в .env: SCRAPINGBEE_API_KEY=ваш_ключ")
+    
+    # Инициализация клиентов
+    if openai_key:
+        try:
+            openai_client = OpenAI(api_key=openai_key)
+            logger.info("✅ OpenAI клиент инициализирован")
+        except Exception as e:
+            logger.error(f"❌ Ошибка инициализации OpenAI: {e}")
+    
+    # Создание приложения
+    app = Application.builder().token(token).build()
+    
+    # Регистрация обработчиков
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("update_resume", update_resume))
+    
+    # Обработчик всех сообщений
+    app.add_handler(MessageHandler(
+        filters.TEXT | filters.Document.PDF,
+        process_message
+    ))
+    
+    # Обработчик ошибок
+    app.add_error_handler(error_handler)
+    
+    # Запуск бота
+    logger.info("🤖 Бот запускается...")
+    print("=" * 50)
+    print("✅ Бот успешно запущен!")
+    print("Отправьте /start в Telegram для начала работы")
+    print("=" * 50)
+    
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == '__main__':
     main()
