@@ -13,6 +13,12 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from openai import OpenAI
 from openai.types.chat import ChatCompletionMessageParam
+from dotenv import load_dotenv  # ✅ ДОБАВЛЕНО: загрузка .env
+
+# =========================
+# ЗАГРУЗКА ПЕРЕМЕННЫХ ОКРУЖЕНИЯ
+# =========================
+load_dotenv()  # ✅ ДОБАВЛЕНО: теперь os.getenv увидит значения из .env
 
 # Настройка логирования
 logging.basicConfig(
@@ -71,7 +77,10 @@ def parse_url_with_scrapingbee(url: str) -> str:
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
             }
         )
-        
+
+        logger.info(f"ScrapingBee статус: {response.status_code}")  # ✅ немного больше логов
+        logger.debug(f"ScrapingBee ответ (фрагмент): {response.text[:300]}")
+
         if response.status_code == 200:
             html = response.text
             
@@ -158,17 +167,39 @@ def clean_text(raw: str) -> str:
     
     return text.strip()
 
-def is_url(text: str) -> bool:
-    """Проверка, является ли текст URL"""
+# --- НОВАЯ ЛОГИКА РАБОТЫ СО ССЫЛКАМИ ---
+
+URL_REGEX = re.compile(
+    r'^(https?://)?([a-z0-9.-]+\.[a-z]{2,})(/.*)?$',
+    re.IGNORECASE
+)
+
+def looks_like_url(text: str) -> bool:
+    """
+    Более мягкая проверка – похоже ли на URL.
+    Поддерживает варианты:
+    - https://hh.ru/vacancy/123
+    - http://example.com
+    - hh.ru/vacancy/123
+    - www.hh.ru/vacancy/123
+    """
     if not text:
         return False
-    
     text = text.strip()
-    try:
-        parsed = urlparse(text)
-        return parsed.scheme in ('http', 'https') and bool(parsed.netloc)
-    except:
-        return False
+    return bool(URL_REGEX.match(text))
+
+def normalize_url(text: str) -> str:
+    """
+    Гарантирует, что URL начинается с http/https.
+    'hh.ru/vacancy/123' -> 'https://hh.ru/vacancy/123'
+    """
+    text = text.strip()
+    if not text.startswith(("http://", "https://")):
+        return "https://" + text
+    return text
+
+# (старую is_url можно оставить, но она больше не используется
+#  – можно удалить, если хочешь полностью очистить код)
 
 def html_to_text(html: str) -> str:
     """Извлечение текста из HTML"""
@@ -286,15 +317,17 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         elif message.text:
             input_text = message.text.strip()
             
-            if is_url(input_text):
+            # ✅ НОВАЯ ЛОГИКА: сначала проверяем, похож ли текст на ссылку
+            if looks_like_url(input_text):
                 # 🔗 ССЫЛКА - парсим через ScrapingBee
-                logger.info(f"🔗 Обработка ссылки: {input_text}")
+                url = normalize_url(input_text)
+                logger.info(f"🔗 Обработка ссылки: {input_text} -> {url}")
                 
                 # Показываем, что бот работает
                 await message.chat.send_action(action="typing")
                 
                 # Парсим через ScrapingBee
-                html = parse_url_with_scrapingbee(input_text)
+                html = parse_url_with_scrapingbee(url)
                 
                 # Извлекаем текст из HTML
                 text_content = html_to_text(html)
