@@ -5,6 +5,6 @@ beautifulsoup4==4.12.3
 pypdf2==3.0.1
 selenium==4.16.0
 webdriver-manager==4.0.1
-cloudscraper==1.2.71      # Для обхода Cloudflare
-fake-useragent==1.4.0     # Для рандомных User-Agent
-browser-cookie3==0.19.1   # Для работы с cookies
+undetected-chromedriver==3.5.4
+cloudscraper==1.2.71
+playwright==1.40.0
