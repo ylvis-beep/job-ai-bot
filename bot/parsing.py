@@ -20,6 +20,7 @@ from config import (
 
 logger = logging.getLogger(__name__)
 
+# Единое "человеческое" сообщение пользователю, когда не удалось получить вакансию по ссылке
 GENERIC_VACANCY_ERROR_MSG = (
     "Не удалось автоматически получить текст вакансии с сайта.\n"
     "Пожалуйста, скопируйте и отправьте текст вакансии вручную."
@@ -62,6 +63,7 @@ def extract_text_from_pdf_bytes(data: bytes) -> str:
         return text
 
     except ValueError:
+        # уже "человеческая" ошибка
         raise
     except Exception as e:
         logger.error(f"❌ Ошибка чтения PDF: {e}", exc_info=True)
@@ -103,7 +105,7 @@ def html_to_text(html: str) -> str:
         return ""
 
 # =========================
-# SELENIUM ДЛЯ RENDER (ИСПРАВЛЕННЫЙ)
+# SELENIUM ДЛЯ RENDER
 # =========================
 
 def init_selenium_driver(proxy_url: Optional[str] = None):
@@ -116,7 +118,7 @@ def init_selenium_driver(proxy_url: Optional[str] = None):
         
         options = Options()
         
-        # КРИТИЧЕСКО ВАЖНО для Render!
+        # КРИТИЧЕСКИ ВАЖНО для Render!
         options.add_argument('--no-sandbox')
         options.add_argument('--disable-dev-shm-usage')
         options.add_argument('--disable-gpu')
@@ -130,7 +132,11 @@ def init_selenium_driver(proxy_url: Optional[str] = None):
         options.add_experimental_option('useAutomationExtension', False)
         
         # User-Agent
-        options.add_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
+        options.add_argument(
+            '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+            'AppleWebKit/537.36 (KHTML, like Gecko) '
+            'Chrome/120.0.0.0 Safari/537.36'
+        )
         
         # Прокси для Selenium
         if proxy_url:
@@ -144,30 +150,28 @@ def init_selenium_driver(proxy_url: Optional[str] = None):
             options.add_argument(f'--proxy-server={proxy_for_selenium}')
             logger.info(f"Используем прокси для Selenium: {proxy_for_selenium}")
         
-        # НАСТРОЙКИ ДЛЯ RENDER:
-        # 1. Устанавливаем переменные окружения для Chrome
-        os.environ['WDM_LOG_LEVEL'] = '0'  # Отключаем логи webdriver-manager
-        os.environ['WDM_LOCAL'] = '1'       # Используем локальный кэш
+        # Настройки для webdriver-manager
+        os.environ['WDM_LOG_LEVEL'] = '0'  # меньше логов
+        os.environ['WDM_LOCAL'] = '1'      # кэш
         
-        # 2. Настройки для webdriver-manager
         service = Service(
             ChromeDriverManager(
-                cache_valid_range=30,  # Кэшируем на 30 дней
-                path="/tmp/chromedriver"  # Сохраняем в /tmp на Render
+                cache_valid_range=30,
+                path="/tmp/chromedriver"
             ).install()
         )
         
-        # 3. Дополнительные аргументы для Render
         options.add_argument('--disable-software-rasterizer')
         options.add_argument('--disable-logging')
         options.add_argument('--log-level=3')
         options.add_argument('--silent')
         
-        # Создаем драйвер
         driver = webdriver.Chrome(service=service, options=options)
         
-        # Скрываем WebDriver
-        driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+        # Скрываем флаг webdriver
+        driver.execute_script(
+            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+        )
         
         return driver
         
@@ -181,7 +185,8 @@ def init_selenium_driver(proxy_url: Optional[str] = None):
 def parse_with_selenium(url: str, proxy_url: Optional[str] = None) -> str:
     """Парсинг через Selenium"""
     if not SELENIUM_ENABLED:
-        raise ValueError("Selenium отключен")
+        # пользователю не говорим про Selenium, просто общее сообщение
+        raise ValueError(GENERIC_VACANCY_ERROR_MSG)
     
     driver = None
     try:
@@ -190,25 +195,23 @@ def parse_with_selenium(url: str, proxy_url: Optional[str] = None) -> str:
         
         driver = init_selenium_driver(proxy_url)
         
-        # Открываем страницу
         driver.get(url)
         
-        # Ждем загрузки
-        wait_time = random.uniform(3, 6)  # Увеличил время для Render
+        # Ждём загрузку
+        wait_time = random.uniform(3, 6)
         time.sleep(wait_time)
         
-        # Прокрутка
+        # Скроллим вниз
         driver.execute_script("window.scrollTo(0, document.body.scrollHeight * 0.5);")
         time.sleep(random.uniform(1, 2))
         driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
         time.sleep(random.uniform(1, 2))
         
-        # Получаем HTML
         html = driver.page_source
         
         # Проверяем на капчу
         if detect_captcha(html):
-            logger.warning("⚠️ Обнаружена капча/блокировка")
+            logger.warning("⚠️ Обнаружена капча/блокировка (Selenium)")
             raise ValueError(GENERIC_VACANCY_ERROR_MSG)
         
         elapsed = time.time() - start_time
@@ -217,13 +220,14 @@ def parse_with_selenium(url: str, proxy_url: Optional[str] = None) -> str:
         return html
         
     except Exception as e:
-        logger.error(f"❌ Selenium ошибка: {e}")
-        raise ValueError(f"Selenium не смог обработать страницу")
+        logger.error(f"❌ Selenium ошибка: {e}", exc_info=True)
+        # Пользователю даём общее сообщение
+        raise ValueError(GENERIC_VACANCY_ERROR_MSG)
     finally:
         if driver:
             try:
                 driver.quit()
-            except:
+            except Exception:
                 pass
 
 def detect_captcha(html: str) -> bool:
@@ -257,9 +261,11 @@ def _normalize_proxy_url(raw: str) -> str:
     if not raw:
         return raw
 
+    # Уже есть схема (http://, socks5:// и т.п.)
     if re.match(r"^[a-zA-Z0-9+.-]+://", raw):
         return raw
 
+    # Форматы вида host:port@user:pass или user:pass@host:port
     if "@" in raw:
         left, right = raw.split("@", 1)
         
@@ -276,6 +282,7 @@ def _normalize_proxy_url(raw: str) -> str:
 
         return f"http://{creds}@{host_port}"
 
+    # Просто host:port
     return f"http://{raw}"
 
 def fetch_html_via_requests(url: str, proxy_url: Optional[str] = None) -> str:
@@ -298,18 +305,23 @@ def fetch_html_via_requests(url: str, proxy_url: Optional[str] = None) -> str:
         html = resp.text
 
         if detect_captcha(html):
+            logger.warning("⚠️ Обнаружена капча/блокировка (Requests)")
             raise ValueError(GENERIC_VACANCY_ERROR_MSG)
 
         if len(html) < 500:
+            logger.warning(f"⚠️ Очень короткий ответ ({len(html)} символов)")
             raise ValueError(GENERIC_VACANCY_ERROR_MSG)
 
         return html
 
     except requests.exceptions.Timeout:
-        raise ValueError("Таймаут при запросе")
-    except requests.RequestException:
+        logger.error("❌ Таймаут при запросе", exc_info=True)
         raise ValueError(GENERIC_VACANCY_ERROR_MSG)
-    except Exception:
+    except requests.RequestException as e:
+        logger.error(f"❌ HTTP ошибка при запросе: {e}", exc_info=True)
+        raise ValueError(GENERIC_VACANCY_ERROR_MSG)
+    except Exception as e:
+        logger.error(f"❌ Непредвиденная ошибка в requests: {e}", exc_info=True)
         raise ValueError(GENERIC_VACANCY_ERROR_MSG)
 
 # =========================
@@ -319,43 +331,47 @@ def fetch_html_via_requests(url: str, proxy_url: Optional[str] = None) -> str:
 def fetch_url_text_via_proxy(url: str) -> str:
     """
     Умный парсер с приоритетами.
-    ВАЖНО: На Render сначала пробуем requests, потом Selenium
+    На Render сначала пробуем requests, потом Selenium, потом без прокси.
     """
     methods_to_try = []
     
-    # На Render лучше сначала requests (быстрее)
+    # 1. Requests + прокси
     if PROXY_URL:
-        methods_to_try.append(("Requests с прокси", lambda: fetch_html_via_requests(url, PROXY_URL)))
+        methods_to_try.append(
+            ("Requests с прокси", lambda: fetch_html_via_requests(url, PROXY_URL))
+        )
     
-    # Потом Selenium (медленнее, но обходит капчи)
+    # 2. Selenium + прокси (если включён)
     if SELENIUM_ENABLED and PROXY_URL:
-        methods_to_try.append(("Selenium с прокси", lambda: parse_with_selenium(url, PROXY_URL)))
+        methods_to_try.append(
+            ("Selenium с прокси", lambda: parse_with_selenium(url, PROXY_URL))
+        )
     
-    # Последний вариант - без прокси
-    methods_to_try.append(("Requests без прокси", lambda: fetch_html_via_requests(url, None)))
+    # 3. Requests без прокси
+    methods_to_try.append(
+        ("Requests без прокси", lambda: fetch_html_via_requests(url, None))
+    )
     
-    # Пробуем все методы
+    last_error: Optional[Exception] = None
+
     for method_name, parser_func in methods_to_try:
         try:
             logger.info(f"🔄 Пробуем {method_name} для {url}")
             html = parser_func()
-            
             text = html_to_text(html)
             
             if text and len(text) >= MIN_MEANINGFUL_TEXT_LENGTH:
                 logger.info(f"✅ {method_name} успешен: {len(text)} символов")
                 return text
             else:
-                logger.warning(f"⚠️ {method_name}: мало текста")
-                
-        except ValueError as e:
-            # Если это пользовательская ошибка - пробрасываем
-            if method_name == methods_to_try[-1][0]:  # Последний метод
-                raise e
-            continue
+                logger.warning(
+                    f"⚠️ {method_name}: мало текста ({len(text) if text else 0} символов)"
+                )
+                last_error = ValueError(GENERIC_VACANCY_ERROR_MSG)
         except Exception as e:
             logger.warning(f"⚠️ {method_name} не сработал: {e}")
+            last_error = e
             continue
     
-    # Все методы не сработали
+    # Всё упало → единое сообщение пользователю
     raise ValueError(GENERIC_VACANCY_ERROR_MSG)
