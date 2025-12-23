@@ -14,7 +14,6 @@ from telegram.ext import (
 from config import TELEGRAM_BOT_TOKEN
 from parsing import (
     extract_text_from_pdf_bytes,
-    extract_text_from_docx_bytes,   # ✅ добавили
     looks_like_url,
     normalize_url,
     clean_text,
@@ -31,9 +30,6 @@ logging.basicConfig(
 )
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
-
-DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-DOC_MIME = "application/msword"
 
 
 # =========================
@@ -64,6 +60,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"📝 Пришли <b>резюме</b> одним из способов:\n"
         f"• PDF\n"
         f"• ссылка\n"
+        f"• текст\n\n"
         f"После резюме я попрошу <b>текст вакансии</b> (или ссылку) и подготовлю письмо."
     )
 
@@ -77,7 +74,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 /update_resume - Обновить резюме
 
 📝 <b>Как использовать:</b>
-1) Нажми /start и отправь резюме (PDF/ссылка/DOCX)
+1) Нажми /start и отправь резюме (PDF/ссылка/текст)
 2) Потом отправь вакансию (ссылка или текст)
 3) Я составлю сопроводительное письмо
 """
@@ -91,8 +88,7 @@ async def update_resume(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "📝 Отправь новое резюме одним из способов:\n\n"
         "• PDF файл\n"
         "• Текст резюме\n"
-        "• Ссылка на резюме\n"
-        "• Word (DOCX)\n\n"
+        "• Ссылка на резюме\n\n"
         "Я сохраню его и дальше буду использовать для анализа вакансий."
     )
 
@@ -102,7 +98,6 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     Основная функция обработки сообщений.
     Логика:
     - PDF → локальный парсер
-    - DOCX → локальный парсер
     - Ссылка → парсим через RU-прокси
     - Текст → используем как есть
     """
@@ -116,46 +111,16 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         text_content = ""
 
         # 1) ОПРЕДЕЛЯЕМ ТИП СООБЩЕНИЯ
-        if message.document:
-            mime = message.document.mime_type
+        if message.document and message.document.mime_type == "application/pdf":
+            # 📄 PDF
+            logger.info(f"📄 Обработка PDF от пользователя {message.from_user.id}")
 
-            if mime == "application/pdf":
-                # 📄 PDF
-                logger.info(f"📄 Обработка PDF от пользователя {message.from_user.id}")
-                file = await message.document.get_file()
-                bio = BytesIO()
-                await file.download_to_memory(out=bio)
+            file = await message.document.get_file()
+            bio = BytesIO()
+            await file.download_to_memory(out=bio)
 
-                text_content = extract_text_from_pdf_bytes(bio.getvalue())
-                logger.info(f"✅ PDF обработан: {len(text_content)} символов")
-
-            elif mime == DOCX_MIME:
-                # 🧾 DOCX
-                logger.info(f"🧾 Обработка DOCX от пользователя {message.from_user.id}")
-                file = await message.document.get_file()
-                bio = BytesIO()
-                await file.download_to_memory(out=bio)
-
-                text_content = extract_text_from_docx_bytes(bio.getvalue())
-                logger.info(f"✅ DOCX обработан: {len(text_content)} символов")
-
-            elif mime == DOC_MIME:
-                # ⚠️ DOC (старый Word) — не поддерживаем без конвертации
-                await message.reply_text(
-                    "⚠️ Формат .DOC (старый Word) сейчас не поддерживается.\n"
-                    "Пожалуйста, отправь резюме в .DOCX или PDF."
-                )
-                return
-
-            else:
-                await message.reply_text(
-                    "❌ Поддерживаются только:\n"
-                    "• PDF\n"
-                    "• DOCX\n"
-                    "• Текст\n"
-                    "• Ссылки"
-                )
-                return
+            text_content = extract_text_from_pdf_bytes(bio.getvalue())
+            logger.info(f"✅ PDF обработан: {len(text_content)} символов")
 
         elif message.text:
             input_text = message.text.strip()
@@ -175,10 +140,9 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         else:
             await message.reply_text(
                 "❌ Поддерживаются только:\n"
-                "• PDF\n"
-                "• DOCX\n"
+                "• PDF файлы\n"
                 "• Текст\n"
-                "• Ссылки"
+                "• Ссылки на сайты"
             )
             return
 
@@ -243,12 +207,9 @@ def main() -> None:
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("update_resume", update_resume))
 
-    # ✅ Принимаем: текст, PDF, DOCX, DOC
+    # ✅ Только текст и PDF
     app.add_handler(MessageHandler(
-        filters.TEXT
-        | filters.Document.PDF
-        | filters.Document.MimeType(DOCX_MIME)
-        | filters.Document.MimeType(DOC_MIME),
+        filters.TEXT | filters.Document.PDF,
         process_message
     ))
 
