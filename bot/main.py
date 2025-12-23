@@ -1,6 +1,5 @@
 # main.py
 import logging
-
 from io import BytesIO
 
 from telegram import Update
@@ -15,6 +14,7 @@ from telegram.ext import (
 from config import TELEGRAM_BOT_TOKEN
 from parsing import (
     extract_text_from_pdf_bytes,
+    extract_text_from_docx_bytes,   # ✅ добавили
     looks_like_url,
     normalize_url,
     clean_text,
@@ -32,23 +32,39 @@ logging.basicConfig(
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
+DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+DOC_MIME = "application/msword"
+
 
 # =========================
 # TELEGRAM BOT ФУНКЦИИ
 # =========================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Команда /start"""
+    """Команда /start: просим резюме (если нет) или вакансию (если резюме уже есть)."""
     user = update.effective_user
+    user_data = context.user_data
+
+    # Если резюме уже есть в памяти — сразу просим вакансию
+    if 'resume' in user_data and user_data['resume']:
+        user_data['awaiting_resume'] = False
+        await update.message.reply_html(
+            f"👋 Привет, {user.mention_html()}!\n\n"
+            f"✅ Я уже помню твоё резюме.\n"
+            f"Теперь пришли <b>вакансию</b> (ссылку или текст) — и я составлю сопроводительное письмо.\n\n"
+            f"Если хочешь заменить резюме — нажми /update_resume."
+        )
+        return
+
+    # Иначе — просим резюме
+    user_data['awaiting_resume'] = True
     await update.message.reply_html(
-        f"👋 Привет {user.mention_html()}!\n\n"
+        f"👋 Привет, {user.mention_html()}!\n\n"
         f"Я помогу составить идеальное сопроводительное письмо.\n\n"
-        f"📝 <b>Как это работает:</b>\n"
-        f"1. Отправь мне свое <b>резюме</b> (текст или PDF)\n"
-        f"2. Потом отправь <b>вакансию</b> (ссылку или текст)\n"
-        f"3. Я проанализирую и составлю письмо\n\n"
-        f"🔗 <b>Поддерживаю:</b> hh.ru, tochka.com, habr.com и другие сайты\n"
-        f"📄 <b>Форматы:</b> PDF, текст, ссылки"
+        f"📝 Пришли <b>резюме</b> одним из способов:\n"
+        f"• PDF\n"
+        f"• ссылка\n"
+        f"После резюме я попрошу <b>текст вакансии</b> (или ссылку) и подготовлю письмо."
     )
 
 
@@ -61,16 +77,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 /update_resume - Обновить резюме
 
 📝 <b>Как использовать:</b>
-1. Сначала отправь резюме командой /update_resume
-2. Потом отправляй вакансии
-3. Я составлю сопроводительное письмо
-
-🔗 <b>Примеры:</b>
-- Отправь PDF с резюме
-- Отправь ссылку на hh.ru/vacancy/123
-- Отправь текст вакансии
-
-💡 <b>Совет:</b> Чем подробнее резюме, тем лучше результат!
+1) Нажми /start и отправь резюме (PDF/ссылка/DOCX)
+2) Потом отправь вакансию (ссылка или текст)
+3) Я составлю сопроводительное письмо
 """
     await update.message.reply_text(help_text, parse_mode='HTML')
 
@@ -79,11 +88,12 @@ async def update_resume(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     """Обновление резюме"""
     context.user_data['awaiting_resume'] = True
     await update.message.reply_text(
-        "📝 Отправь свое резюме одним из способов:\n\n"
-        "• PDF файл с резюме\n"
+        "📝 Отправь новое резюме одним из способов:\n\n"
+        "• PDF файл\n"
         "• Текст резюме\n"
-        "• Ссылку на резюме\n\n"
-        "Я сохраню его для последующего анализа вакансий."
+        "• Ссылка на резюме\n"
+        "• Word (DOCX)\n\n"
+        "Я сохраню его и дальше буду использовать для анализа вакансий."
     )
 
 
@@ -92,7 +102,8 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     Основная функция обработки сообщений.
     Логика:
     - PDF → локальный парсер
-    - Ссылка → парсим через RU-прокси (Bright Data и т.п.)
+    - DOCX → локальный парсер
+    - Ссылка → парсим через RU-прокси
     - Текст → используем как есть
     """
     message = update.message
@@ -104,47 +115,76 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     try:
         text_content = ""
 
-        # 1. ОПРЕДЕЛЯЕМ ТИП СООБЩЕНИЯ
-        if message.document and message.document.mime_type == "application/pdf":
-            # 📄 PDF ФАЙЛ - парсим локально
-            logger.info(f"📄 Обработка PDF от пользователя {message.from_user.id}")
+        # 1) ОПРЕДЕЛЯЕМ ТИП СООБЩЕНИЯ
+        if message.document:
+            mime = message.document.mime_type
 
-            file = await message.document.get_file()
-            bio = BytesIO()
-            await file.download_to_memory(out=bio)
+            if mime == "application/pdf":
+                # 📄 PDF
+                logger.info(f"📄 Обработка PDF от пользователя {message.from_user.id}")
+                file = await message.document.get_file()
+                bio = BytesIO()
+                await file.download_to_memory(out=bio)
 
-            text_content = extract_text_from_pdf_bytes(bio.getvalue())
-            logger.info(f"✅ PDF обработан: {len(text_content)} символов")
+                text_content = extract_text_from_pdf_bytes(bio.getvalue())
+                logger.info(f"✅ PDF обработан: {len(text_content)} символов")
+
+            elif mime == DOCX_MIME:
+                # 🧾 DOCX
+                logger.info(f"🧾 Обработка DOCX от пользователя {message.from_user.id}")
+                file = await message.document.get_file()
+                bio = BytesIO()
+                await file.download_to_memory(out=bio)
+
+                text_content = extract_text_from_docx_bytes(bio.getvalue())
+                logger.info(f"✅ DOCX обработан: {len(text_content)} символов")
+
+            elif mime == DOC_MIME:
+                # ⚠️ DOC (старый Word) — не поддерживаем без конвертации
+                await message.reply_text(
+                    "⚠️ Формат .DOC (старый Word) сейчас не поддерживается.\n"
+                    "Пожалуйста, отправь резюме в .DOCX или PDF."
+                )
+                return
+
+            else:
+                await message.reply_text(
+                    "❌ Поддерживаются только:\n"
+                    "• PDF\n"
+                    "• DOCX\n"
+                    "• Текст\n"
+                    "• Ссылки"
+                )
+                return
 
         elif message.text:
             input_text = message.text.strip()
 
             if looks_like_url(input_text):
-                # 🔗 ССЫЛКА - парсим через RU-прокси
+                # 🔗 ССЫЛКА
                 url = normalize_url(input_text)
                 logger.info(f"🔗 Обработка ссылки: {input_text} -> {url}")
 
                 await message.chat.send_action(action="typing")
-
                 text_content = fetch_url_text_via_proxy(url)
-
             else:
-                # 📝 ОБЫЧНЫЙ ТЕКСТ - используем как есть
+                # 📝 ТЕКСТ
                 text_content = clean_text(input_text)
                 logger.info(f"📝 Обработка текста: {len(text_content)} символов")
 
         else:
             await message.reply_text(
                 "❌ Поддерживаются только:\n"
-                "• PDF файлы\n"
+                "• PDF\n"
+                "• DOCX\n"
                 "• Текст\n"
-                "• Ссылки на сайты"
+                "• Ссылки"
             )
             return
 
-        # 2. ПРОВЕРЯЕМ КОНТЕКСТ (резюме или вакансия)
+        # 2) ПРОВЕРЯЕМ КОНТЕКСТ (резюме или вакансия)
         if user_data.get('awaiting_resume'):
-            # 📋 СОХРАНЯЕМ РЕЗЮМЕ
+            # 📋 СОХРАНЯЕМ РЕЗЮМЕ В ПАМЯТИ ЧАТА
             user_data['resume'] = text_content
             user_data['awaiting_resume'] = False
 
@@ -155,6 +195,7 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 f"и я составлю сопроводительное письмо!",
                 parse_mode='HTML'
             )
+            return
 
         elif 'resume' in user_data:
             # 🎯 АНАЛИЗИРУЕМ ВАКАНСИЮ
@@ -162,8 +203,8 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
         else:
             await message.reply_text(
-                "📝 Сначала отправь свое <b>резюме</b> командой /update_resume,\n"
-                "а потом - вакансию для анализа.",
+                "📝 Сначала отправь <b>резюме</b> командой /start или /update_resume,\n"
+                "а потом — вакансию для анализа.",
                 parse_mode='HTML'
             )
 
@@ -202,8 +243,12 @@ def main() -> None:
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("update_resume", update_resume))
 
+    # ✅ Принимаем: текст, PDF, DOCX, DOC
     app.add_handler(MessageHandler(
-        filters.TEXT | filters.Document.PDF,
+        filters.TEXT
+        | filters.Document.PDF
+        | filters.Document.MimeType(DOCX_MIME)
+        | filters.Document.MimeType(DOC_MIME),
         process_message
     ))
 
