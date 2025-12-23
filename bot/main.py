@@ -40,16 +40,15 @@ logger = logging.getLogger(__name__)
 # =========================
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))  # ты уже добавил(а) в окружение
 STATS_TZ = ZoneInfo("Europe/Helsinki")
-STATS_DAILY_TIME = dtime(hour=9, minute=0, tzinfo=STATS_TZ)  # каждый день в 09:00 (Хельсинки)
+STATS_DAILY_AT = dtime(hour=9, minute=0)  # каждый день в 09:00 (по Хельсинки)
 
 
 # =========================
-# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ СТАТИСТИКИ (без БД, в памяти)
+# СТАТИСТИКА (без БД, в памяти процесса)
 # =========================
-def _ensure_stats_structures(context: ContextTypes.DEFAULT_TYPE) -> None:
-    bd = context.application.bot_data
-    bd.setdefault("users", {})  # user_id -> {"last_seen": iso, "username": str, "first_seen": iso}
-    bd.setdefault("counters", {
+def _ensure_stats(bot_data: dict) -> None:
+    bot_data.setdefault("users", {})  # user_id -> {"last_seen": iso, "first_seen": iso, "username": str}
+    bot_data.setdefault("counters", {
         "messages": 0,
         "resumes_saved": 0,
         "vacancies_processed": 0,
@@ -60,14 +59,15 @@ def _ensure_stats_structures(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 def touch_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Отмечаем пользователя и увеличиваем общий счётчик сообщений."""
-    _ensure_stats_structures(context)
+    bd = context.application.bot_data
+    _ensure_stats(bd)
 
     user = update.effective_user
     if not user:
         return
 
-    users = context.application.bot_data["users"]
-    counters = context.application.bot_data["counters"]
+    users = bd["users"]
+    counters = bd["counters"]
 
     now = datetime.now(timezone.utc).isoformat()
     is_new = user.id not in users
@@ -84,18 +84,19 @@ def touch_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 def inc_counter(context: ContextTypes.DEFAULT_TYPE, key: str, amount: int = 1) -> None:
-    _ensure_stats_structures(context)
-    context.application.bot_data["counters"][key] += amount
+    bd = context.application.bot_data
+    _ensure_stats(bd)
+    bd["counters"][key] += amount
 
 
-def build_stats_text(context: ContextTypes.DEFAULT_TYPE) -> str:
-    _ensure_stats_structures(context)
+def build_stats_text_from_bot_data(bot_data: dict) -> str:
+    _ensure_stats(bot_data)
 
-    users = context.application.bot_data["users"]
-    counters = context.application.bot_data["counters"]
+    users = bot_data["users"]
+    counters = bot_data["counters"]
 
-    now = datetime.now(timezone.utc)
-    day_ago = now - timedelta(hours=24)
+    now_utc = datetime.now(timezone.utc)
+    day_ago = now_utc - timedelta(hours=24)
 
     active_24h = 0
     for info in users.values():
@@ -121,17 +122,38 @@ def build_stats_text(context: ContextTypes.DEFAULT_TYPE) -> str:
     )
 
 
-async def send_daily_stats(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Ежедневная отправка статистики админу (без команды в Telegram)."""
+async def daily_stats_loop(app: Application) -> None:
+    """Фоновая задача: раз в день шлёт статистику админу. Без JobQueue."""
     if ADMIN_ID <= 0:
         return
 
-    text = build_stats_text(context)
-    try:
-        await context.bot.send_message(chat_id=ADMIN_ID, text=text)
-    except Exception as e:
-        # Не делаем raise, чтобы job не падал постоянно
-        logger.error(f"Не удалось отправить ежедневную статистику админу: {e}", exc_info=True)
+    while True:
+        try:
+            now = datetime.now(STATS_TZ)
+            target = datetime.combine(now.date(), STATS_DAILY_AT, tzinfo=STATS_TZ)
+            if now >= target:
+                target = target + timedelta(days=1)
+
+            sleep_seconds = (target - now).total_seconds()
+            await asyncio.sleep(sleep_seconds)
+
+            text = build_stats_text_from_bot_data(app.bot_data)
+            await app.bot.send_message(chat_id=ADMIN_ID, text=text)
+
+        except asyncio.CancelledError:
+            # корректное завершение при остановке приложения
+            raise
+        except Exception as e:
+            logger.error(f"Не удалось отправить ежедневную статистику: {e}", exc_info=True)
+            # небольшая пауза, чтобы не уйти в tight loop при ошибке
+            await asyncio.sleep(60)
+
+
+async def post_init(app: Application) -> None:
+    """Запускается после старта приложения — создаём фоновую задачу статистики."""
+    if ADMIN_ID > 0:
+        app.create_task(daily_stats_loop(app))
+        logger.info(f"📈 Ежедневная статистика включена: admin={ADMIN_ID}, time={STATS_DAILY_AT} {STATS_TZ.key}")
 
 
 # =========================
@@ -139,13 +161,11 @@ async def send_daily_stats(context: ContextTypes.DEFAULT_TYPE) -> None:
 # =========================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Команда /start: просим резюме (если нет) или вакансию (если резюме уже есть)."""
     touch_user(update, context)
 
     user = update.effective_user
     user_data = context.user_data
 
-    # Если резюме уже есть в памяти — сразу просим вакансию
     if 'resume' in user_data and user_data['resume']:
         user_data['awaiting_resume'] = False
         await update.message.reply_html(
@@ -156,7 +176,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
-    # Иначе — просим резюме
     user_data['awaiting_resume'] = True
     await update.message.reply_html(
         f"👋 Привет, {user.mention_html()}!\n\n"
@@ -170,7 +189,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Команда /help"""
     touch_user(update, context)
 
     help_text = """
@@ -188,7 +206,6 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def update_resume(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обновление резюме"""
     touch_user(update, context)
 
     context.user_data['awaiting_resume'] = True
@@ -202,16 +219,6 @@ async def update_resume(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Основная функция обработки сообщений.
-    Логика:
-    - PDF → локальный парсер
-    - Ссылка → парсим через RU-прокси
-    - Текст → используем как есть
-
-    При параллельной обработке апдейтов делаем лок "по пользователю",
-    чтобы сообщения одного пользователя обрабатывались последовательно.
-    """
     touch_user(update, context)
 
     message = update.message
@@ -221,7 +228,7 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     user_data = context.user_data
     user_id = message.from_user.id
 
-    # ✅ ЛОК НА ПОЛЬЗОВАТЕЛЯ: последовательно внутри user_id, параллельно между разными user_id
+    # лок на пользователя (последовательно внутри одного user_id)
     locks = context.application.bot_data.setdefault("user_locks", {})
     lock = locks.setdefault(user_id, asyncio.Lock())
 
@@ -229,9 +236,8 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         try:
             text_content = ""
 
-            # 1) ОПРЕДЕЛЯЕМ ТИП СООБЩЕНИЯ
+            # PDF
             if message.document and message.document.mime_type == "application/pdf":
-                # 📄 PDF
                 logger.info(f"📄 Обработка PDF от пользователя {user_id}")
 
                 file = await message.document.get_file()
@@ -241,21 +247,17 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 text_content = extract_text_from_pdf_bytes(bio.getvalue())
                 logger.info(f"✅ PDF обработан: {len(text_content)} символов")
 
+            # Текст / ссылка
             elif message.text:
                 input_text = message.text.strip()
 
                 if looks_like_url(input_text):
-                    # 🔗 ССЫЛКА
                     url = normalize_url(input_text)
                     logger.info(f"🔗 Обработка ссылки: {input_text} -> {url}")
 
                     await message.chat.send_action(action="typing")
-
-                    # ✅ чтобы не блокировать event loop (и других пользователей)
                     text_content = await asyncio.to_thread(fetch_url_text_via_proxy, url)
-
                 else:
-                    # 📝 ТЕКСТ
                     text_content = clean_text(input_text)
                     logger.info(f"📝 Обработка текста: {len(text_content)} символов")
 
@@ -268,9 +270,8 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 )
                 return
 
-            # 2) ПРОВЕРЯЕМ КОНТЕКСТ (резюме или вакансия)
+            # резюме или вакансия
             if user_data.get('awaiting_resume'):
-                # 📋 СОХРАНЯЕМ РЕЗЮМЕ В ПАМЯТИ ЧАТА
                 user_data['resume'] = text_content
                 user_data['awaiting_resume'] = False
                 inc_counter(context, "resumes_saved", 1)
@@ -285,7 +286,6 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 return
 
             elif 'resume' in user_data:
-                # 🎯 АНАЛИЗИРУЕМ ВАКАНСИЮ
                 inc_counter(context, "vacancies_processed", 1)
                 await analyze_vacancy(message, user_data['resume'], text_content)
 
@@ -298,7 +298,6 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
         except ValueError as e:
             await message.reply_text(f"⚠️ {str(e)}")
-
         except Exception as e:
             inc_counter(context, "errors", 1)
             logger.error(f"❌ Критическая ошибка: {str(e)}", exc_info=True)
@@ -309,50 +308,39 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обработка ошибок уровня приложения"""
     inc_counter(context, "errors", 1)
     logger.error(f"Ошибка в боте: {context.error}", exc_info=True)
 
     if update and update.message:
         await update.message.reply_text(
             "⚠️ Произошла техническая ошибка.\n"
-            "Попробуйте позже."
+            "Разработчики уже уведомлены. Попробуйте позже."
         )
 
 
 def main() -> None:
-    """Запуск бота"""
     if not TELEGRAM_BOT_TOKEN:
         print("❌ ОШИБКА: TELEGRAM_BOT_TOKEN не найден!")
         print("Передайте TELEGRAM_BOT_TOKEN как переменную окружения в Render.")
         return
 
-    # ✅ Включаем параллельную обработку апдейтов
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).concurrent_updates(True).build()
+    app = (
+        Application.builder()
+        .token(TELEGRAM_BOT_TOKEN)
+        .concurrent_updates(True)
+        .post_init(post_init)   # ✅ запускаем фоновую задачу после старта
+        .build()
+    )
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("update_resume", update_resume))
 
-    # ✅ Только текст и PDF
-    app.add_handler(MessageHandler(
-        filters.TEXT | filters.Document.PDF,
-        process_message
-    ))
+    app.add_handler(MessageHandler(filters.TEXT | filters.Document.PDF, process_message))
 
     app.add_error_handler(error_handler)
 
-    # ✅ Ежедневный отчёт админу (если ADMIN_ID задан)
-    if ADMIN_ID > 0:
-        app.job_queue.run_daily(send_daily_stats, time=STATS_DAILY_TIME)
-        logger.info(f"📈 Ежедневная статистика включена: admin={ADMIN_ID}, time={STATS_DAILY_TIME}")
-
     logger.info("🤖 Бот запускается...")
-    print("=" * 50)
-    print("✅ Бот успешно запущен!")
-    print("Отправьте /start в Telegram для начала работы")
-    print("=" * 50)
-
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
