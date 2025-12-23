@@ -1,5 +1,6 @@
 # main.py
 import logging
+import asyncio
 from io import BytesIO
 
 from telegram import Update
@@ -100,87 +101,100 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     - PDF → локальный парсер
     - Ссылка → парсим через RU-прокси
     - Текст → используем как есть
+
+    ⚠️ Важно: при включенной параллельной обработке апдейтов мы
+    делаем лок "по пользователю", чтобы сообщения одного пользователя
+    обрабатывались строго последовательно.
     """
     message = update.message
     if not message:
         return
 
     user_data = context.user_data
+    user_id = message.from_user.id
 
-    try:
-        text_content = ""
+    # ✅ ЛОК НА ПОЛЬЗОВАТЕЛЯ: последовательно внутри user_id, параллельно между разными user_id
+    locks = context.application.bot_data.setdefault("user_locks", {})
+    lock = locks.setdefault(user_id, asyncio.Lock())
 
-        # 1) ОПРЕДЕЛЯЕМ ТИП СООБЩЕНИЯ
-        if message.document and message.document.mime_type == "application/pdf":
-            # 📄 PDF
-            logger.info(f"📄 Обработка PDF от пользователя {message.from_user.id}")
+    async with lock:
+        try:
+            text_content = ""
 
-            file = await message.document.get_file()
-            bio = BytesIO()
-            await file.download_to_memory(out=bio)
+            # 1) ОПРЕДЕЛЯЕМ ТИП СООБЩЕНИЯ
+            if message.document and message.document.mime_type == "application/pdf":
+                # 📄 PDF
+                logger.info(f"📄 Обработка PDF от пользователя {user_id}")
 
-            text_content = extract_text_from_pdf_bytes(bio.getvalue())
-            logger.info(f"✅ PDF обработан: {len(text_content)} символов")
+                file = await message.document.get_file()
+                bio = BytesIO()
+                await file.download_to_memory(out=bio)
 
-        elif message.text:
-            input_text = message.text.strip()
+                text_content = extract_text_from_pdf_bytes(bio.getvalue())
+                logger.info(f"✅ PDF обработан: {len(text_content)} символов")
 
-            if looks_like_url(input_text):
-                # 🔗 ССЫЛКА
-                url = normalize_url(input_text)
-                logger.info(f"🔗 Обработка ссылки: {input_text} -> {url}")
+            elif message.text:
+                input_text = message.text.strip()
 
-                await message.chat.send_action(action="typing")
-                text_content = fetch_url_text_via_proxy(url)
+                if looks_like_url(input_text):
+                    # 🔗 ССЫЛКА
+                    url = normalize_url(input_text)
+                    logger.info(f"🔗 Обработка ссылки: {input_text} -> {url}")
+
+                    await message.chat.send_action(action="typing")
+
+                    # ✅ чтобы не блокировать обработку других апдейтов
+                    text_content = await asyncio.to_thread(fetch_url_text_via_proxy, url)
+
+                else:
+                    # 📝 ТЕКСТ
+                    text_content = clean_text(input_text)
+                    logger.info(f"📝 Обработка текста: {len(text_content)} символов")
+
             else:
-                # 📝 ТЕКСТ
-                text_content = clean_text(input_text)
-                logger.info(f"📝 Обработка текста: {len(text_content)} символов")
+                await message.reply_text(
+                    "❌ Поддерживаются только:\n"
+                    "• PDF файлы\n"
+                    "• Текст\n"
+                    "• Ссылки на сайты"
+                )
+                return
 
-        else:
+            # 2) ПРОВЕРЯЕМ КОНТЕКСТ (резюме или вакансия)
+            if user_data.get('awaiting_resume'):
+                # 📋 СОХРАНЯЕМ РЕЗЮМЕ В ПАМЯТИ ЧАТА
+                user_data['resume'] = text_content
+                user_data['awaiting_resume'] = False
+
+                await message.reply_text(
+                    f"✅ <b>Резюме сохранено!</b>\n\n"
+                    f"📊 Получено: {len(text_content)} символов\n\n"
+                    f"Теперь отправь <b>вакансию</b> (ссылку или текст),\n"
+                    f"и я составлю сопроводительное письмо!",
+                    parse_mode='HTML'
+                )
+                return
+
+            elif 'resume' in user_data:
+                # 🎯 АНАЛИЗИРУЕМ ВАКАНСИЮ
+                await analyze_vacancy(message, user_data['resume'], text_content)
+
+            else:
+                await message.reply_text(
+                    "📝 Сначала отправь <b>резюме</b> командой /start или /update_resume,\n"
+                    "а потом — вакансию для анализа.",
+                    parse_mode='HTML'
+                )
+
+        except ValueError as e:
+            await message.reply_text(f"⚠️ {str(e)}")
+
+        except Exception as e:
+            logger.error(f"❌ Критическая ошибка: {str(e)}", exc_info=True)
             await message.reply_text(
-                "❌ Поддерживаются только:\n"
-                "• PDF файлы\n"
-                "• Текст\n"
-                "• Ссылки на сайты"
+                "❌ Произошла непредвиденная ошибка.\n"
+                "Попробуйте еще раз или свяжитесь с поддержкой."
             )
-            return
-
-        # 2) ПРОВЕРЯЕМ КОНТЕКСТ (резюме или вакансия)
-        if user_data.get('awaiting_resume'):
-            # 📋 СОХРАНЯЕМ РЕЗЮМЕ В ПАМЯТИ ЧАТА
-            user_data['resume'] = text_content
-            user_data['awaiting_resume'] = False
-
-            await message.reply_text(
-                f"✅ <b>Резюме сохранено!</b>\n\n"
-                f"📊 Получено: {len(text_content)} символов\n\n"
-                f"Теперь отправь <b>вакансию</b> (ссылку или текст),\n"
-                f"и я составлю сопроводительное письмо!",
-                parse_mode='HTML'
-            )
-            return
-
-        elif 'resume' in user_data:
-            # 🎯 АНАЛИЗИРУЕМ ВАКАНСИЮ
-            await analyze_vacancy(message, user_data['resume'], text_content)
-
-        else:
-            await message.reply_text(
-                "📝 Сначала отправь <b>резюме</b> командой /start или /update_resume,\n"
-                "а потом — вакансию для анализа.",
-                parse_mode='HTML'
-            )
-
-    except ValueError as e:
-        await message.reply_text(f"⚠️ {str(e)}")
-
-    except Exception as e:
-        logger.error(f"❌ Критическая ошибка: {str(e)}", exc_info=True)
-        await message.reply_text(
-            "❌ Произошла непредвиденная ошибка.\n"
-            "Попробуйте еще раз или свяжитесь с поддержкой."
-        )
 
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -190,7 +204,7 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if update and update.message:
         await update.message.reply_text(
             "⚠️ Произошла техническая ошибка.\n"
-            "Разработчики уже уведомлены. Попробуйте позже."
+            "Попробуйте позже."
         )
 
 
@@ -201,7 +215,9 @@ def main() -> None:
         print("Передайте TELEGRAM_BOT_TOKEN как переменную окружения в Render.")
         return
 
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    # ✅ Включаем параллельную обработку апдейтов
+    # True = дефолтный лимит (обычно до 256 конкурентных апдейтов)
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).concurrent_updates(True).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
