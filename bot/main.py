@@ -1,7 +1,10 @@
 # main.py
 import logging
 import asyncio
+import os
 from io import BytesIO
+from datetime import datetime, timedelta, timezone, time as dtime
+from zoneinfo import ZoneInfo
 
 from telegram import Update
 from telegram.ext import (
@@ -32,6 +35,104 @@ logging.basicConfig(
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
+# =========================
+# ADMIN / STATS SETTINGS (из окружения)
+# =========================
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))  # ты уже добавил(а) в окружение
+STATS_TZ = ZoneInfo("Europe/Helsinki")
+STATS_DAILY_TIME = dtime(hour=9, minute=0, tzinfo=STATS_TZ)  # каждый день в 09:00 (Хельсинки)
+
+
+# =========================
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ СТАТИСТИКИ (без БД, в памяти)
+# =========================
+def _ensure_stats_structures(context: ContextTypes.DEFAULT_TYPE) -> None:
+    bd = context.application.bot_data
+    bd.setdefault("users", {})  # user_id -> {"last_seen": iso, "username": str, "first_seen": iso}
+    bd.setdefault("counters", {
+        "messages": 0,
+        "resumes_saved": 0,
+        "vacancies_processed": 0,
+        "errors": 0,
+        "new_users": 0,
+    })
+
+
+def touch_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Отмечаем пользователя и увеличиваем общий счётчик сообщений."""
+    _ensure_stats_structures(context)
+
+    user = update.effective_user
+    if not user:
+        return
+
+    users = context.application.bot_data["users"]
+    counters = context.application.bot_data["counters"]
+
+    now = datetime.now(timezone.utc).isoformat()
+    is_new = user.id not in users
+
+    users[user.id] = {
+        "last_seen": now,
+        "first_seen": users.get(user.id, {}).get("first_seen", now),
+        "username": user.username or "",
+    }
+
+    counters["messages"] += 1
+    if is_new:
+        counters["new_users"] += 1
+
+
+def inc_counter(context: ContextTypes.DEFAULT_TYPE, key: str, amount: int = 1) -> None:
+    _ensure_stats_structures(context)
+    context.application.bot_data["counters"][key] += amount
+
+
+def build_stats_text(context: ContextTypes.DEFAULT_TYPE) -> str:
+    _ensure_stats_structures(context)
+
+    users = context.application.bot_data["users"]
+    counters = context.application.bot_data["counters"]
+
+    now = datetime.now(timezone.utc)
+    day_ago = now - timedelta(hours=24)
+
+    active_24h = 0
+    for info in users.values():
+        try:
+            last_seen = datetime.fromisoformat(info["last_seen"])
+            if last_seen >= day_ago:
+                active_24h += 1
+        except Exception:
+            continue
+
+    total_users = len(users)
+
+    return (
+        "📊 Статистика бота (в памяти, с момента последнего запуска)\n\n"
+        f"• Всего уникальных пользователей: {total_users}\n"
+        f"• Активных за 24 часа: {active_24h}\n"
+        f"• Новых пользователей за запуск: {counters.get('new_users', 0)}\n\n"
+        f"• Сообщений обработано: {counters.get('messages', 0)}\n"
+        f"• Резюме сохранено: {counters.get('resumes_saved', 0)}\n"
+        f"• Вакансий обработано: {counters.get('vacancies_processed', 0)}\n"
+        f"• Ошибок: {counters.get('errors', 0)}\n\n"
+        f"🕒 Отчёт: {datetime.now(STATS_TZ).strftime('%Y-%m-%d %H:%M')} ({STATS_TZ.key})"
+    )
+
+
+async def send_daily_stats(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Ежедневная отправка статистики админу (без команды в Telegram)."""
+    if ADMIN_ID <= 0:
+        return
+
+    text = build_stats_text(context)
+    try:
+        await context.bot.send_message(chat_id=ADMIN_ID, text=text)
+    except Exception as e:
+        # Не делаем raise, чтобы job не падал постоянно
+        logger.error(f"Не удалось отправить ежедневную статистику админу: {e}", exc_info=True)
+
 
 # =========================
 # TELEGRAM BOT ФУНКЦИИ
@@ -39,6 +140,8 @@ logger = logging.getLogger(__name__)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Команда /start: просим резюме (если нет) или вакансию (если резюме уже есть)."""
+    touch_user(update, context)
+
     user = update.effective_user
     user_data = context.user_data
 
@@ -68,6 +171,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Команда /help"""
+    touch_user(update, context)
+
     help_text = """
 📋 <b>Доступные команды:</b>
 /start - Начать работу
@@ -84,6 +189,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 async def update_resume(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обновление резюме"""
+    touch_user(update, context)
+
     context.user_data['awaiting_resume'] = True
     await update.message.reply_text(
         "📝 Отправь новое резюме одним из способов:\n\n"
@@ -102,10 +209,11 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     - Ссылка → парсим через RU-прокси
     - Текст → используем как есть
 
-    ⚠️ Важно: при включенной параллельной обработке апдейтов мы
-    делаем лок "по пользователю", чтобы сообщения одного пользователя
-    обрабатывались строго последовательно.
+    При параллельной обработке апдейтов делаем лок "по пользователю",
+    чтобы сообщения одного пользователя обрабатывались последовательно.
     """
+    touch_user(update, context)
+
     message = update.message
     if not message:
         return
@@ -143,7 +251,7 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
                     await message.chat.send_action(action="typing")
 
-                    # ✅ чтобы не блокировать обработку других апдейтов
+                    # ✅ чтобы не блокировать event loop (и других пользователей)
                     text_content = await asyncio.to_thread(fetch_url_text_via_proxy, url)
 
                 else:
@@ -165,6 +273,7 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 # 📋 СОХРАНЯЕМ РЕЗЮМЕ В ПАМЯТИ ЧАТА
                 user_data['resume'] = text_content
                 user_data['awaiting_resume'] = False
+                inc_counter(context, "resumes_saved", 1)
 
                 await message.reply_text(
                     f"✅ <b>Резюме сохранено!</b>\n\n"
@@ -177,6 +286,7 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
             elif 'resume' in user_data:
                 # 🎯 АНАЛИЗИРУЕМ ВАКАНСИЮ
+                inc_counter(context, "vacancies_processed", 1)
                 await analyze_vacancy(message, user_data['resume'], text_content)
 
             else:
@@ -190,6 +300,7 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await message.reply_text(f"⚠️ {str(e)}")
 
         except Exception as e:
+            inc_counter(context, "errors", 1)
             logger.error(f"❌ Критическая ошибка: {str(e)}", exc_info=True)
             await message.reply_text(
                 "❌ Произошла непредвиденная ошибка.\n"
@@ -198,7 +309,8 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Обработка ошибок"""
+    """Обработка ошибок уровня приложения"""
+    inc_counter(context, "errors", 1)
     logger.error(f"Ошибка в боте: {context.error}", exc_info=True)
 
     if update and update.message:
@@ -216,7 +328,6 @@ def main() -> None:
         return
 
     # ✅ Включаем параллельную обработку апдейтов
-    # True = дефолтный лимит (обычно до 256 конкурентных апдейтов)
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).concurrent_updates(True).build()
 
     app.add_handler(CommandHandler("start", start))
@@ -230,6 +341,11 @@ def main() -> None:
     ))
 
     app.add_error_handler(error_handler)
+
+    # ✅ Ежедневный отчёт админу (если ADMIN_ID задан)
+    if ADMIN_ID > 0:
+        app.job_queue.run_daily(send_daily_stats, time=STATS_DAILY_TIME)
+        logger.info(f"📈 Ежедневная статистика включена: admin={ADMIN_ID}, time={STATS_DAILY_TIME}")
 
     logger.info("🤖 Бот запускается...")
     print("=" * 50)
