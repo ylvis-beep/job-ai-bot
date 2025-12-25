@@ -10,3 +10,4 @@ cloudscraper==1.2.71
 lxml==5.2.2
 fake-useragent==1.5.0
 undetected-chromedriver==3.5.5
+apify-client
